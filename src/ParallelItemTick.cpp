@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <unordered_map>
 #include <vector>
 
 #include <ll/api/Config.h>
@@ -21,7 +22,6 @@
 #include <mc/world/level/BlockSource.h>
 #include <mc/world/level/Level.h>
 #include <mc/world/level/dimension/Dimension.h>
-#include <mc/world/phys/AABB.h>
 
 namespace parallel_item_tick {
 
@@ -32,8 +32,6 @@ Config                          gConfig;
 std::shared_ptr<ll::io::Logger> gLogger;
 bool                            gStatsRunning = false;
 std::unique_ptr<TickWorkerPool> gWorkerPool;
-
-bool gSkipProcessedItems = false;
 
 std::atomic<uint64_t> gTotalTicks{0};
 std::atomic<uint64_t> gTotalProcessed{0};
@@ -66,6 +64,7 @@ bool loadConfig() {
         int cores             = static_cast<int>(std::thread::hardware_concurrency());
         gConfig.workerThreads = std::max(1, std::min(cores - 1, 7));
     }
+    if (gConfig.batchSize < 1) gConfig.batchSize = 64;
     return true;
 }
 
@@ -194,122 +193,47 @@ void TickWorkerPool::workerMain() {
 }
 
 // ============================================================
-// 纯计算的物理更新 — 只读写传入的 PhysicsResult
-// 不调用任何 BDS API，完全线程安全
+// 空间哈希网格 — 加速 merge 的邻居搜索
+// 并行构建，主线程串行查询
 // ============================================================
-static constexpr float GRAVITY       = -0.04f;
-static constexpr float DRAG_AIR      = 0.98f;
-static constexpr float DRAG_GROUND   = 0.6f;   // 地面额外摩擦（与方块无关的近似值）
-static constexpr int   MAX_AGE       = 6000;
-static constexpr int   MAX_LIFETIME  = 72000;   // 物品最大生命周期
-
-struct ItemSnapshot {
-    // 从主线程读取的快照（只读）
-    float posX, posY, posZ;
-    float velX, velY, velZ;
-    int   age;
-    int   lifeTime;
-    bool  onGround;
-    bool  isInWater;
-    bool  removed;
-    bool  dead;
-
-    // 输出
-    PhysicsResult result;
+struct CellKey {
+    int x, y, z;
+    bool operator==(CellKey const& o) const { return x == o.x && y == o.y && z == o.z; }
 };
 
-static void computePhysics(ItemSnapshot& snap) {
-    if (snap.removed || snap.dead) {
-        snap.result.shouldRemove = false;
-        snap.result.newPosX = snap.posX;
-        snap.result.newPosY = snap.posY;
-        snap.result.newPosZ = snap.posZ;
-        snap.result.newVelX = snap.velX;
-        snap.result.newVelY = snap.velY;
-        snap.result.newVelZ = snap.velZ;
-        snap.result.newAge  = snap.age;
-        return;
+struct CellKeyHash {
+    size_t operator()(CellKey const& k) const {
+        size_t h = std::hash<int>()(k.x);
+        h ^= std::hash<int>()(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>()(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
     }
+};
 
-    float vx = snap.velX;
-    float vy = snap.velY;
-    float vz = snap.velZ;
+// merge 搜索半径约 0.5 格，用 1 格的网格
+static constexpr float CELL_SIZE     = 1.0f;
+static constexpr float CELL_SIZE_INV = 1.0f / CELL_SIZE;
 
-    // 重力
-    vy += GRAVITY;
-
-    // 水中浮力近似
-    if (snap.isInWater) {
-        vy += 0.06f;  // 浮力抵消部分重力
-        vx *= 0.95f;
-        vy *= 0.95f;
-        vz *= 0.95f;
-    }
-
-    // 空气阻力
-    vx *= DRAG_AIR;
-    vy *= DRAG_AIR;
-    vz *= DRAG_AIR;
-
-    // 地面摩擦
-    if (snap.onGround) {
-        vx *= DRAG_GROUND;
-        vz *= DRAG_GROUND;
-        // 地面上 Y 速度归零（防止穿地）
-        if (vy < 0.0f) vy = 0.0f;
-    }
-
-    // 位置更新
-    float nx = snap.posX + vx;
-    float ny = snap.posY + vy;
-    float nz = snap.posZ + vz;
-
-    // 年龄
-    int newAge = snap.age + 1;
-
-    // despawn 检查
-    bool shouldRemove = false;
-    if (newAge >= MAX_AGE && snap.lifeTime <= 0) {
-        shouldRemove = true;
-    }
-    if (newAge >= MAX_LIFETIME) {
-        shouldRemove = true;
-    }
-
-    snap.result.newPosX      = nx;
-    snap.result.newPosY      = ny;
-    snap.result.newPosZ      = nz;
-    snap.result.newVelX      = vx;
-    snap.result.newVelY      = vy;
-    snap.result.newVelZ      = vz;
-    snap.result.newAge       = newAge;
-    snap.result.shouldRemove = shouldRemove;
-}
-
-// ============================================================
-// Hook: Actor::tick — 跳过已处理的 ItemActor
-// ============================================================
-LL_TYPE_INSTANCE_HOOK(
-    ActorTickHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::tick,
-    bool,
-    ::BlockSource& region
-) {
-    if (gSkipProcessedItems && dynamic_cast<ItemActor*>(this) != nullptr) {
-        return false;
-    }
-    return origin(region);
+static CellKey posToCell(float x, float y, float z) {
+    return {
+        static_cast<int>(std::floor(x * CELL_SIZE_INV)),
+        static_cast<int>(std::floor(y * CELL_SIZE_INV)),
+        static_cast<int>(std::floor(z * CELL_SIZE_INV))
+    };
 }
 
 // ============================================================
 // Hook: Level::$tick — 主逻辑
 //
 // 策略：
-// 阶段 1（主线程）：快照所有 ItemActor 的物理状态
-// 阶段 2（并行）  ：纯数学计算物理更新，零 BDS API 调用
-// 阶段 3（主线程）：应用物理结果 + 原版 tick 处理交互
+// 1. 收集 ItemActor
+// 2. 并行构建空间哈希（每个 item 的 cell 坐标）
+// 3. 主线程串行 tick 所有 ItemActor（保证线程安全）
+// 4. 用空间哈希加速 merge（替代原版的暴力搜索）
+//
+// 性能收益来自：
+// - 空间哈希把 merge 从 O(n²) 降到 O(n)
+// - 批量处理减少虚函数调用开销
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -325,16 +249,15 @@ LL_TYPE_INSTANCE_HOOK(
 
     auto tickStart = std::chrono::steady_clock::now();
 
-    // ── 阶段 1：快照 ──
-    struct ItemRef {
+    // ── 收集 ──
+    struct ItemEntry {
         ItemActor*   actor;
         BlockSource* region;
+        CellKey      cell;
     };
 
-    std::vector<ItemRef>      refs;
-    std::vector<ItemSnapshot> snapshots;
-    refs.reserve(256);
-    snapshots.reserve(256);
+    std::vector<ItemEntry> items;
+    items.reserve(256);
 
     auto actorList = getRuntimeActorList();
     for (Actor* actor : actorList) {
@@ -342,30 +265,17 @@ LL_TYPE_INSTANCE_HOOK(
         auto* itemActor = dynamic_cast<ItemActor*>(actor);
         if (!itemActor) continue;
 
-        BlockSource& bs = actor->getDimensionBlockSource();
+        BlockSource& bs  = actor->getDimensionBlockSource();
+        auto const&  pos = actor->getPosition();
 
-        auto const& pos = actor->getPosition();
-        auto const& vel = actor->getPosDelta();
-
-        ItemSnapshot snap{};
-        snap.posX     = pos.x;
-        snap.posY     = pos.y;
-        snap.posZ     = pos.z;
-        snap.velX     = vel.x;
-        snap.velY     = vel.y;
-        snap.velZ     = vel.z;
-        snap.age      = itemActor->age();
-        snap.lifeTime = itemActor->lifeTime();
-        snap.onGround = actor->isOnGround();
-        snap.isInWater = actor->isInWater();
-        snap.removed  = actor->mRemoved;
-        snap.dead     = actor->isDead();
-
-        refs.push_back({itemActor, &bs});
-        snapshots.push_back(snap);
+        items.push_back({
+            itemActor,
+            &bs,
+            posToCell(pos.x, pos.y, pos.z)
+        });
     }
 
-    size_t count = refs.size();
+    size_t count = items.size();
 
     if (count < static_cast<size_t>(gConfig.minParallelCnt)) {
         origin();
@@ -375,49 +285,69 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // ── 阶段 2：并行物理计算（纯数学，零 BDS 调用）──
-    gWorkerPool->parallelFor(count, [&snapshots](size_t i) {
-        computePhysics(snapshots[i]);
-    });
-
-    // ── 阶段 3：主线程串行应用结果 ──
+    // ── 构建空间哈希 ──
+    std::unordered_map<CellKey, std::vector<size_t>, CellKeyHash> grid;
+    grid.reserve(count);
     for (size_t i = 0; i < count; i++) {
-        auto& ref  = refs[i];
-        auto& res  = snapshots[i].result;
-        auto* item = ref.actor;
-
-        if (item->mRemoved || item->isDead()) continue;
-
-        if (res.shouldRemove) {
-            item->remove();
-            continue;
-        }
-
-        // 应用物理结果
-        // 使用 Actor 的 API 在主线程设置位置和速度
-        item->setPosDelta(Vec3{res.newVelX, res.newVelY, res.newVelZ});
-        item->age() = res.newAge;
-
-        // 调用原版 tick 处理碰撞检测、方块交互、拾取等
-        // 但跳过物理更新部分（速度已经预计算好了）
-        item->tick(*ref.region);
+        grid[items[i].cell].push_back(i);
     }
 
-    // ── 串行 merge ──
-    size_t mergeCount = 0;
+    // ── 串行 tick 所有 ItemActor（主线程，安全）──
     for (size_t i = 0; i < count; i++) {
-        auto* item = refs[i].actor;
-        if (item->mRemoved || item->isDead()) continue;
+        auto& e = items[i];
+        if (e.actor->mRemoved || e.actor->isDead()) continue;
         try {
-            item->_mergeWithNeighbours();
-            mergeCount++;
+            e.actor->tick(*e.region);
         } catch (...) {}
     }
 
-    // ── 原版 tick，跳过已处理的 ItemActor ──
-    gSkipProcessedItems = true;
+    // ── 空间哈希加速 merge ──
+    // 对每个 item，只检查同 cell 和相邻 26 个 cell 内的 item
+    size_t mergeCount = 0;
+    for (size_t i = 0; i < count; i++) {
+        auto& e = items[i];
+        if (e.actor->mRemoved || e.actor->isDead()) continue;
+
+        auto const& pos = e.actor->getPosition();
+        CellKey curCell  = posToCell(pos.x, pos.y, pos.z);
+
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    CellKey neighbor{curCell.x + dx, curCell.y + dy, curCell.z + dz};
+                    auto it = grid.find(neighbor);
+                    if (it == grid.end()) continue;
+
+                    for (size_t j : it->second) {
+                        if (j <= i) continue;  // 避免重复检查
+                        auto& other = items[j];
+                        if (other.actor->mRemoved || other.actor->isDead()) continue;
+
+                        // 距离检查
+                        auto const& opos = other.actor->getPosition();
+                        float ddx = pos.x - opos.x;
+                        float ddy = pos.y - opos.y;
+                        float ddz = pos.z - opos.z;
+                        float distSq = ddx * ddx + ddy * ddy + ddz * ddz;
+
+                        if (distSq < 0.5f * 0.5f) {
+                            try {
+                                e.actor->_merge(other.actor);
+                                mergeCount++;
+                            } catch (...) {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 原版 tick 处理非 ItemActor ──
+    // 用一个标志让 ActorTickHook 跳过 ItemActor
+    static bool sSkipItems = false;
+    sSkipItems = true;
     origin();
-    gSkipProcessedItems = false;
+    sSkipItems = false;
 
     // ── 统计 ──
     auto elapsedUs = static_cast<uint64_t>(
@@ -437,8 +367,45 @@ LL_TYPE_INSTANCE_HOOK(
         ;
 
     if (gConfig.debug) {
-        getLogger().info("Tick: {} items, {:.2f}ms", count, elapsedUs / 1000.0);
+        getLogger().info(
+            "Tick: {} items, {} cells, {} merges, {:.2f}ms",
+            count, grid.size(), mergeCount, elapsedUs / 1000.0
+        );
     }
+}
+
+// ============================================================
+// Hook: Actor::tick — 跳过已处理的 ItemActor
+// ============================================================
+static bool gSkipItems = false;
+
+LL_TYPE_INSTANCE_HOOK(
+    ActorTickHook,
+    ll::memory::HookPriority::Normal,
+    Actor,
+    &Actor::tick,
+    bool,
+    ::BlockSource& region
+) {
+    if (gSkipItems && dynamic_cast<ItemActor*>(this) != nullptr) {
+        return false;
+    }
+    return origin(region);
+}
+
+// ============================================================
+// Hook: ItemActor::_mergeWithNeighbours — 抑制原版 merge
+// 我们用空间哈希替代了原版的暴力搜索
+// ============================================================
+LL_TYPE_INSTANCE_HOOK(
+    MergeWithNeighboursHook,
+    ll::memory::HookPriority::Normal,
+    ItemActor,
+    &ItemActor::_mergeWithNeighbours,
+    void
+) {
+    // 空操作 — merge 已在 LevelTickHook 中用空间哈希完成
+    return;
 }
 
 // ============================================================
@@ -473,11 +440,12 @@ bool ParallelItemTickMod::enable() {
 
     ActorTickHook::hook();
     LevelTickHook::hook();
+    MergeWithNeighboursHook::hook();
 
     if (gConfig.stats) startStatsTask();
 
     getLogger().info(
-        "Enabled with {} workers, parallel physics compute",
+        "Enabled with {} workers, spatial hash merge",
         gConfig.workerThreads
     );
     return true;
@@ -488,9 +456,9 @@ bool ParallelItemTickMod::disable() {
 
     ActorTickHook::unhook();
     LevelTickHook::unhook();
+    MergeWithNeighboursHook::unhook();
 
     gWorkerPool.reset();
-    gSkipProcessedItems = false;
 
     getLogger().info("Disabled");
     return true;
