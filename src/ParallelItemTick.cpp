@@ -25,12 +25,12 @@ namespace parallel_item_tick {
 // ============================================================
 // 全局变量
 // ============================================================
-Config                         gConfig;
+Config                          gConfig;
 std::shared_ptr<ll::io::Logger> gLogger;
-bool                           gStatsRunning    = false;
+bool                            gStatsRunning    = false;
 std::unique_ptr<TickWorkerPool> gWorkerPool;
 
-thread_local bool gSuppressMerge     = false;
+thread_local bool gSuppressMerge      = false;
 bool              gSkipProcessedItems = false;
 
 std::atomic<uint64_t> gTotalTicks{0};
@@ -58,8 +58,7 @@ bool loadConfig() {
         getLogger().info("Config not found, creating default config.json");
         return saveConfig();
     }
-    auto res = ll::config::loadConfig(gConfig, path);
-    if (!res) {
+    if (!ll::config::loadConfig(gConfig, path)) {
         getLogger().warn("Failed to load config, using defaults");
     }
     if (gConfig.minParallelCnt < 1) gConfig.minParallelCnt = 16;
@@ -68,7 +67,7 @@ bool loadConfig() {
         int cores             = (int)std::thread::hardware_concurrency();
         gConfig.workerThreads = std::max(1, std::min(cores - 1, 7));
     }
-    return res;
+    return true;
 }
 
 bool saveConfig() {
@@ -95,16 +94,14 @@ void startStatsTask() {
                 auto totalTime    = gTotalTimeUs.load(std::memory_order_relaxed);
                 auto maxTime      = gMaxTimeUs.load(std::memory_order_relaxed);
 
-                double avgTime = totalTicks ? (double)totalTime / totalTicks : 0.0;
-
                 getLogger().info(
                     "Stats (5s): frames={}, items/frame={:.1f}, merges/frame={:.1f}, "
                     "avgTime={:.2f}ms, maxTime={:.2f}ms",
                     totalTicks,
                     totalTicks ? (double)totalProcess / totalTicks : 0.0,
                     totalTicks ? (double)totalMerged  / totalTicks : 0.0,
-                    avgTime / 1000.0,
-                    maxTime / 1000.0
+                    totalTicks ? (double)totalTime    / totalTicks / 1000.0 : 0.0,
+                    (double)maxTime / 1000.0
                 );
 
                 gTotalTicks.store(0,     std::memory_order_relaxed);
@@ -185,7 +182,6 @@ void TickWorkerPool::executeWork() {
 
 // ============================================================
 // Hook 1: ItemActor::_mergeWithNeighbours
-// 并行阶段 gSuppressMerge=true 时跳过，防止并发 merge
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     MergeWithNeighboursHook,
@@ -196,39 +192,35 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     if (gSuppressMerge) return;
     origin();
-    // 串行 merge 路径才统计
     gTotalMerged.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ============================================================
 // Hook 2: Actor::tick
-// Actor::tick 返回 bool，ItemActor 继承此方法
-// 当 gSkipProcessedItems=true 且是 ItemActor 时跳过（已被并行处理）
+// 用 dynamic_cast 判断是否为 ItemActor，避免使用 ActorType 枚举
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorTickHook,
     ll::memory::HookPriority::Normal,
     Actor,
     &Actor::tick,
-    bool,           // 返回值是 bool
+    bool,
     ::BlockSource& region
 ) {
-    // 跳过已并行处理的 ItemActor
-    if (gSkipProcessedItems && isType(ActorType::Item)) {
+    if (gSkipProcessedItems && dynamic_cast<ItemActor*>(this) != nullptr) {
         return false;
     }
     return origin(region);
 }
 
 // ============================================================
-// Hook 3: Level::$tick（虚函数用 $ 前缀）
-// 在此收集所有 ItemActor 并行 tick
+// Hook 3: Level::$tick
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
     Level,
-    &Level::$tick,  // 虚函数必须用 $tick
+    &Level::$tick,
     void
 ) {
     if (!gConfig.enabled) {
@@ -238,7 +230,6 @@ LL_TYPE_INSTANCE_HOOK(
 
     auto tickStart = std::chrono::steady_clock::now();
 
-    // 收集所有 ItemActor
     struct ItemEntry {
         ItemActor*   actor;
         BlockSource* region;
@@ -246,23 +237,22 @@ LL_TYPE_INSTANCE_HOOK(
     std::vector<ItemEntry> items;
     items.reserve(256);
 
-    // 使用 getRuntimeActorList() 遍历所有 Actor
-    // 签名: virtual std::vector<Actor*> getRuntimeActorList() const
+    // 遍历所有 Actor，过滤出 ItemActor
     auto actorList = getRuntimeActorList();
     for (Actor* actor : actorList) {
         if (!actor) continue;
-        // mRemoved 是 bool 成员变量，直接访问
         if (actor->mRemoved) continue;
-        // isType 检查是否是 ItemActor
-        if (!actor->isType(ActorType::Item)) continue;
-        // getDimensionBlockSource() 返回 BlockSource&
+        // 用 dynamic_cast 安全判断类型，不依赖 ActorType 枚举
+        auto* itemActor = dynamic_cast<ItemActor*>(actor);
+        if (!itemActor) continue;
         BlockSource& bs = actor->getDimensionBlockSource();
-        items.push_back({ static_cast<ItemActor*>(actor), &bs });
+        items.push_back({ itemActor, &bs });
     }
 
     size_t count = items.size();
 
-    if (count < (size_t)gConfig.minParallelCnt || count == 0) {
+    if (count < (size_t)gConfig.minParallelCnt) {
+        // 数量不足，走原版逻辑
         origin();
         if (gConfig.debug) {
             getLogger().info("Skipped parallel (count={} < min={})", count, gConfig.minParallelCnt);
@@ -270,21 +260,20 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 阶段 1: 并行 tick（抑制 merge，tick 返回 bool 忽略即可）
+    // 阶段 1: 并行 tick（抑制 merge）
     gWorkerPool->parallelFor(count, [&items](size_t i) {
         gSuppressMerge = true;
-        items[i].actor->tick(*items[i].region); // 返回值 bool，忽略
+        items[i].actor->tick(*items[i].region);
         gSuppressMerge = false;
     });
 
     // 阶段 2: 串行 merge
     for (auto& e : items) {
-        // 用 mRemoved 成员变量检查，或 isDead()
         if (e.actor->mRemoved || e.actor->isDead()) continue;
         e.actor->_mergeWithNeighbours();
     }
 
-    // 阶段 3: 原版 tick，ActorTickHook 会跳过已处理的 ItemActor
+    // 阶段 3: 原版 tick，ActorTickHook 跳过已处理的 ItemActor
     gSkipProcessedItems = true;
     origin();
     gSkipProcessedItems = false;
@@ -297,7 +286,6 @@ LL_TYPE_INSTANCE_HOOK(
     gTotalProcessed.fetch_add(count, std::memory_order_relaxed);
     gTotalTimeUs.fetch_add(elapsedUs, std::memory_order_relaxed);
 
-    // 更新最大耗时
     uint64_t curMax = gMaxTimeUs.load(std::memory_order_relaxed);
     while (elapsedUs > curMax &&
            !gMaxTimeUs.compare_exchange_weak(curMax, elapsedUs, std::memory_order_relaxed));
@@ -308,7 +296,7 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// 插件主类
+// 插件主类实现
 // ============================================================
 ParallelItemTickMod& ParallelItemTickMod::getInstance() {
     static ParallelItemTickMod instance;
@@ -317,7 +305,6 @@ ParallelItemTickMod& ParallelItemTickMod::getInstance() {
 
 ParallelItemTickMod::ParallelItemTickMod() : mSelf(*ll::mod::NativeMod::current()) {}
 
-// 在 .cpp 里定义（头文件只声明不写函数体，避免 C2084）
 ll::mod::NativeMod& ParallelItemTickMod::getSelf() const { return mSelf; }
 
 bool ParallelItemTickMod::load() {
@@ -371,9 +358,6 @@ bool ParallelItemTickMod::disable() {
 } // namespace parallel_item_tick
 
 // ============================================================
-// 注册插件
+// 注册插件 - LL_REGISTER_MOD 只接受类名
 // ============================================================
-LL_REGISTER_MOD(
-    parallel_item_tick::ParallelItemTickMod,
-    parallel_item_tick::ParallelItemTickMod::getInstance()
-);
+LL_REGISTER_MOD(parallel_item_tick::ParallelItemTickMod);
