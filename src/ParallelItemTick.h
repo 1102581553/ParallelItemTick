@@ -1,4 +1,4 @@
-// ParallelItemTick.h (修复版)
+// ParallelItemTick.h
 #pragma once
 
 #include <atomic>
@@ -31,7 +31,7 @@ public:
     explicit TickWorkerPool(int numWorkers);
     ~TickWorkerPool();
 
-    TickWorkerPool(TickWorkerPool const&) = delete;
+    TickWorkerPool(TickWorkerPool const&)            = delete;
     TickWorkerPool& operator=(TickWorkerPool const&) = delete;
 
     void parallelFor(size_t count, std::function<void(size_t)> const& func);
@@ -42,19 +42,19 @@ private:
     void workerMain(int id);
     void executeWork();
 
-    int                                    mNumWorkers;
-    std::vector<std::thread>               mWorkers;
-    std::atomic<bool>                      mShutdown{false};
-    std::atomic<uint64_t>                  mGeneration{0};
-    std::function<void(size_t)> const*     mWorkFunc{nullptr};
-    size_t                                 mWorkCount{0};
-    std::atomic<size_t>                    mNextIndex{0};
-    std::latch*                            mDoneLatch{nullptr};
+    int                                 mNumWorkers;
+    std::vector<std::thread>            mWorkers;
+    std::atomic<bool>                   mShutdown{false};
+    std::atomic<uint64_t>               mGeneration{0};
+    std::function<void(size_t)> const*  mWorkFunc{nullptr};
+    size_t                              mWorkCount{0};
+    std::atomic<size_t>                 mNextIndex{0};
+    std::latch*                         mDoneLatch{nullptr};
 };
 
-extern Config                         gConfig;
+extern Config                          gConfig;
 extern std::shared_ptr<ll::io::Logger> gLogger;
-extern bool                           gStatsRunning;
+extern bool                            gStatsRunning;
 extern std::unique_ptr<TickWorkerPool> gWorkerPool;
 
 extern thread_local bool gSuppressMerge;
@@ -67,10 +67,10 @@ extern std::atomic<uint64_t> gTotalTimeUs;
 extern std::atomic<uint64_t> gMaxTimeUs;
 
 ll::io::Logger& getLogger();
-bool loadConfig();
-bool saveConfig();
-void startStatsTask();
-void stopStatsTask();
+bool            loadConfig();
+bool            saveConfig();
+void            startStatsTask();
+void            stopStatsTask();
 
 class ParallelItemTickMod {
 public:
@@ -78,7 +78,7 @@ public:
 
     ParallelItemTickMod();
 
-
+    // 只声明，不在头文件里定义函数体
     [[nodiscard]] ll::mod::NativeMod& getSelf() const;
 
     bool load();
