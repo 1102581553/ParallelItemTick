@@ -130,10 +130,6 @@ static CellKey posToCell(float x, float y, float z) {
     };
 }
 
-static int getCellColor(const CellKey& key) {
-    return ((key.x % 2 + 2) % 2 + (key.y % 2 + 2) % 2 + (key.z % 2 + 2) % 2) % 2;
-}
-
 // ============================================================
 // 全局状态
 // ============================================================
@@ -286,111 +282,136 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// 并行空间哈希合并（棋盘格分区）
+// 合并候选对
 // ============================================================
+struct MergePair {
+    size_t a;
+    size_t b;
+};
+
 struct ItemInfo {
     ItemActor* actor;
     int64_t    uid;
     float      x, y, z;
 };
 
-static size_t doParallelSpatialMerge(std::vector<ItemInfo>& items) {
-    if (items.empty()) return 0;
+// 并行查找合并候选对（纯只读，不调用任何 BDS API）
+static std::vector<MergePair> findMergeCandidatesParallel(std::vector<ItemInfo>& items) {
+    if (items.empty()) return {};
 
-    // 构建空间哈希
+    // 构建空间哈希（主线程，快速）
     std::unordered_map<CellKey, std::vector<size_t>, CellKeyHash> grid;
     grid.reserve(items.size());
 
+    // 预计算每个 item 的可合并信息
+    struct ItemMergeInfo {
+        bool  valid;
+        short itemId;
+        short auxValue;
+        uchar count;
+        uchar maxStack;
+    };
+    std::vector<ItemMergeInfo> mergeInfo(items.size());
+
     for (size_t i = 0; i < items.size(); ++i) {
-        if (items[i].actor->mRemoved) continue;
+        auto* a = items[i].actor;
+        if (a->mRemoved || a->isDead()) {
+            mergeInfo[i].valid = false;
+            continue;
+        }
+        auto& stack = a->item();
+        if (stack.isNull()) {
+            mergeInfo[i].valid = false;
+            continue;
+        }
+        mergeInfo[i].valid    = true;
+        mergeInfo[i].itemId   = stack.getId();
+        mergeInfo[i].auxValue = stack.getAuxValue();
+        mergeInfo[i].count    = stack.mCount;
+        mergeInfo[i].maxStack = stack.getMaxStackSize();
+
         auto key = posToCell(items[i].x, items[i].y, items[i].z);
         grid[key].push_back(i);
     }
 
-    // 按颜色分组
-    std::vector<CellKey> color0Cells;
-    std::vector<CellKey> color1Cells;
+    // 收集所有 cell key
+    std::vector<CellKey> allCells;
+    allCells.reserve(grid.size());
     for (auto& [key, _] : grid) {
-        if (getCellColor(key) == 0)
-            color0Cells.push_back(key);
-        else
-            color1Cells.push_back(key);
+        allCells.push_back(key);
     }
 
-    std::atomic<size_t> totalMerges{0};
+    // 并行查找候选对
+    std::mutex pairsMutex;
+    std::vector<MergePair> allPairs;
 
-    // 处理一组同色 cell 的合并
-    auto processCells = [&](std::vector<CellKey>& cells) {
-        if (cells.empty()) return;
+    std::vector<std::function<void()>> tasks;
+    size_t cellsPerTask = std::max<size_t>(1, allCells.size() / (gThreadPool->threadCount() * 2));
 
-        std::vector<std::function<void()>> tasks;
-        size_t cellsPerTask = std::max<size_t>(
-            1, cells.size() / (gThreadPool->threadCount() * 2)
-        );
+    for (size_t start = 0; start < allCells.size(); start += cellsPerTask) {
+        size_t end = std::min(start + cellsPerTask, allCells.size());
+        tasks.push_back([&, start, end] {
+            std::vector<MergePair> localPairs;
 
-        for (size_t start = 0; start < cells.size(); start += cellsPerTask) {
-            size_t end = std::min(start + cellsPerTask, cells.size());
-            tasks.push_back([&, start, end] {
-                size_t localMerges = 0;
-                for (size_t ci = start; ci < end; ++ci) {
-                    auto& cellKey = cells[ci];
-                    auto  cellIt  = grid.find(cellKey);
-                    if (cellIt == grid.end()) continue;
+            for (size_t ci = start; ci < end; ++ci) {
+                auto& cellKey = allCells[ci];
+                auto  cellIt  = grid.find(cellKey);
+                if (cellIt == grid.end()) continue;
 
-                    for (size_t idx : cellIt->second) {
-                        auto* a = items[idx].actor;
-                        if (a->mRemoved || a->isDead()) continue;
+                for (size_t idx : cellIt->second) {
+                    auto& infoA = mergeInfo[idx];
+                    if (!infoA.valid) continue;
+                    if (infoA.count >= infoA.maxStack) continue;
 
-                        auto& stackA = a->item();
-                        if (stackA.isNull()) continue;
+                    // 只搜索同 cell 和 +方向邻居（避免重复）
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dz = (dx == 0 ? 0 : -1); dz <= 1; ++dz) {
+                                CellKey nk{cellKey.x + dx, cellKey.y + dy, cellKey.z + dz};
+                                auto nit = grid.find(nk);
+                                if (nit == grid.end()) continue;
 
-                        int maxStack = static_cast<int>(stackA.getMaxStackSize());
-                        if (static_cast<int>(stackA.mCount) >= maxStack) continue;
+                                for (size_t j : nit->second) {
+                                    if (j <= idx) continue;
+                                    auto& infoB = mergeInfo[j];
+                                    if (!infoB.valid) continue;
 
-                        for (int dx = -1; dx <= 1; ++dx) {
-                            for (int dy = -1; dy <= 1; ++dy) {
-                                for (int dz = -1; dz <= 1; ++dz) {
-                                    CellKey nk{cellKey.x + dx, cellKey.y + dy, cellKey.z + dz};
-                                    auto nit = grid.find(nk);
-                                    if (nit == grid.end()) continue;
+                                    // 快速检查：同物品类型
+                                    if (infoA.itemId != infoB.itemId) continue;
+                                    if (infoA.auxValue != infoB.auxValue) continue;
 
-                                    for (size_t j : nit->second) {
-                                        if (j <= idx) continue;
-                                        auto* b = items[j].actor;
-                                        if (b->mRemoved || b->isDead()) continue;
+                                    // 距离检查
+                                    float ddx = items[idx].x - items[j].x;
+                                    float ddy = items[idx].y - items[j].y;
+                                    float ddz = items[idx].z - items[j].z;
+                                    if (ddx * ddx + ddy * ddy + ddz * ddz > 1.0f) continue;
 
-                                        if (a->_merge(b)) {
-                                            localMerges++;
-                                            if (static_cast<int>(stackA.mCount) >= maxStack)
-                                                goto nextItemInCell;
-                                        }
-                                    }
+                                    localPairs.push_back({idx, j});
                                 }
                             }
                         }
-                        nextItemInCell:;
                     }
                 }
-                totalMerges.fetch_add(localMerges, std::memory_order_relaxed);
-            });
-        }
+            }
 
-        if (tasks.size() > 1) {
-            gThreadPool->submitAndWait(tasks);
-        } else if (!tasks.empty()) {
-            tasks[0]();
-        }
-    };
+            if (!localPairs.empty()) {
+                std::lock_guard lock(pairsMutex);
+                allPairs.insert(allPairs.end(), localPairs.begin(), localPairs.end());
+            }
+        });
+    }
 
-    processCells(color0Cells);
-    processCells(color1Cells);
+    if (tasks.size() > 1) {
+        gThreadPool->submitAndWait(tasks);
+    } else if (!tasks.empty()) {
+        tasks[0]();
+    }
 
-    return totalMerges.load(std::memory_order_relaxed);
+    return allPairs;
 }
 
 // ============================================================
 // Hook: Level::$tick — 主逻辑
-// 主线程串行 tick（跳过合并所以很快）+ 并行空间哈希合并
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -408,7 +429,6 @@ LL_TYPE_INSTANCE_HOOK(
 
     clearTicked();
 
-    // 收集 ItemActor
     std::vector<ItemInfo> items;
     items.reserve(512);
 
@@ -429,7 +449,7 @@ LL_TYPE_INSTANCE_HOOK(
     if (count > 0) {
         gInCustomPhase.store(true, std::memory_order_release);
 
-        // 阶段1：主线程串行 tick（_mergeWithNeighbours 被跳过，所以很快）
+        // 阶段1：主线程串行 tick（_mergeWithNeighbours 被跳过）
         for (auto& e : items) {
             if (e.actor->mRemoved || e.actor->isDead()) continue;
             BlockSource& bs = e.actor->getDimensionBlockSource();
@@ -437,7 +457,7 @@ LL_TYPE_INSTANCE_HOOK(
             markTicked(e.uid);
         }
 
-        // 更新位置（tick 后可能移动了）
+        // 更新位置
         for (auto& e : items) {
             if (e.actor->mRemoved) continue;
             auto& pos = e.actor->getPosition();
@@ -446,8 +466,20 @@ LL_TYPE_INSTANCE_HOOK(
             e.z = pos.z;
         }
 
-        // 阶段2：并行空间哈希合并（棋盘格分区，线程安全）
-        mergeCount = doParallelSpatialMerge(items);
+        // 阶段2：并行查找合并候选对（纯只读计算，不调用 BDS API）
+        auto pairs = findMergeCandidatesParallel(items);
+
+        // 阶段3：主线程串行执行合并（调用 BDS API）
+        for (auto& p : pairs) {
+            auto* a = items[p.a].actor;
+            auto* b = items[p.b].actor;
+            if (a->mRemoved || a->isDead()) continue;
+            if (b->mRemoved || b->isDead()) continue;
+
+            if (a->_merge(b)) {
+                mergeCount++;
+            }
+        }
 
         gInCustomPhase.store(false, std::memory_order_release);
     }
@@ -473,8 +505,8 @@ LL_TYPE_INSTANCE_HOOK(
 
     if (gConfig.debug) {
         getLogger().info(
-            "Tick: {} items, {} merges, {:.2f}ms",
-            count, mergeCount, elapsedUs / 1000.0
+            "Tick: {} items, {} merges, {} candidates, {:.2f}ms",
+            count, mergeCount, pairs.size(), elapsedUs / 1000.0
         );
     }
 }
@@ -521,7 +553,7 @@ bool ParallelItemTickMod::enable() {
     if (gConfig.stats) startStatsTask();
 
     getLogger().info(
-        "Enabled — {} threads, main-thread tick (no merge) + parallel spatial merge",
+        "Enabled — {} threads, parallel candidate search + O(n) spatial hash",
         threads
     );
     return true;
