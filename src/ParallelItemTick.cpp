@@ -2,12 +2,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <filesystem>
 #include <functional>
 #include <mutex>
 #include <queue>
-#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,6 +25,7 @@
 #include <mc/world/actor/Actor.h>
 #include <mc/world/actor/ActorType.h>
 #include <mc/world/actor/item/ItemActor.h>
+#include <mc/world/item/ItemStack.h>
 #include <mc/world/level/BlockSource.h>
 #include <mc/world/level/Level.h>
 
@@ -52,7 +53,6 @@ public:
         }
     }
 
-    // 提交 N 个独立任务，等待全部完成
     void submitAndWait(std::vector<std::function<void()>>& tasks) {
         if (tasks.empty()) return;
 
@@ -106,35 +106,48 @@ private:
 static std::unique_ptr<ThreadPool> gThreadPool;
 
 // ============================================================
-// 并行阶段标志
+// 空间哈希 — 用于 O(1) 合并查找
 // ============================================================
-static std::atomic<bool> gInParallelPhase{false};
+struct CellKey {
+    int x, y, z;
+    bool operator==(const CellKey& o) const { return x == o.x && y == o.y && z == o.z; }
+};
 
-// ============================================================
-// 延迟操作队列
-// ============================================================
-static std::mutex                         gDeferredMutex;
-static std::vector<std::function<void()>> gDeferredActions;
+struct CellKeyHash {
+    size_t operator()(const CellKey& k) const {
+        size_t h = std::hash<int>()(k.x);
+        h ^= std::hash<int>()(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>()(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
 
-static void deferAction(std::function<void()> action) {
-    std::lock_guard lock(gDeferredMutex);
-    gDeferredActions.push_back(std::move(action));
+// 每个 cell 是 1x1x1 方块
+static CellKey posToCell(float x, float y, float z) {
+    return {
+        static_cast<int>(std::floor(x)),
+        static_cast<int>(std::floor(y)),
+        static_cast<int>(std::floor(z))
+    };
 }
 
-static void executeDeferredActions() {
-    std::vector<std::function<void()>> actions;
-    {
-        std::lock_guard lock(gDeferredMutex);
-        actions.swap(gDeferredActions);
-    }
-    for (auto& a : actions) {
-        a();
-    }
-}
-
 // ============================================================
+// 全局状态
+// ============================================================
+Config                          gConfig;
+std::shared_ptr<ll::io::Logger> gLogger;
+bool                            gStatsRunning = false;
+
+std::atomic<uint64_t> gTotalTicks{0};
+std::atomic<uint64_t> gTotalProcessed{0};
+std::atomic<uint64_t> gTotalMerges{0};
+std::atomic<uint64_t> gTotalTimeUs{0};
+std::atomic<uint64_t> gMaxTimeUs{0};
+
+// 标记是否在我们的自定义 tick 阶段
+static std::atomic<bool> gInCustomPhase{false};
+
 // 已处理集合
-// ============================================================
 static std::mutex                       gTickedMutex;
 static std::unordered_set<const Actor*> gTickedItems;
 
@@ -152,53 +165,6 @@ static void clearTicked() {
     std::lock_guard lock(gTickedMutex);
     gTickedItems.clear();
 }
-
-// ============================================================
-// 空间分区 — 棋盘格模式
-// 将世界按 chunk（16x16）分区，用棋盘格着色
-// 同一颜色的 chunk 之间至少隔一个 chunk，不会互相影响
-// 分两轮执行：先黑格并行，再白格并行
-// ============================================================
-struct ChunkKey {
-    int x, z;
-    bool operator==(const ChunkKey& o) const { return x == o.x && z == o.z; }
-};
-
-struct ChunkKeyHash {
-    size_t operator()(const ChunkKey& k) const {
-        return std::hash<int64_t>()(static_cast<int64_t>(k.x) << 32 | static_cast<uint32_t>(k.z));
-    }
-};
-
-struct ItemEntry {
-    ItemActor*   actor;
-    BlockSource* region;
-};
-
-static ChunkKey getChunkKey(const Actor* actor) {
-    auto& pos = actor->getPosition();
-    return {
-        static_cast<int>(std::floor(pos.x)) >> 4,
-        static_cast<int>(std::floor(pos.z)) >> 4
-    };
-}
-
-// 棋盘格颜色：(chunkX + chunkZ) % 2
-static int getChunkColor(const ChunkKey& key) {
-    return ((key.x % 2 + 2) % 2 + (key.z % 2 + 2) % 2) % 2;
-}
-
-// ============================================================
-// 全局状态
-// ============================================================
-Config                          gConfig;
-std::shared_ptr<ll::io::Logger> gLogger;
-bool                            gStatsRunning = false;
-
-std::atomic<uint64_t> gTotalTicks{0};
-std::atomic<uint64_t> gTotalProcessed{0};
-std::atomic<uint64_t> gTotalTimeUs{0};
-std::atomic<uint64_t> gMaxTimeUs{0};
 
 ll::io::Logger& getLogger() {
     if (!gLogger) {
@@ -236,14 +202,16 @@ void startStatsTask() {
 
                 auto totalTicks = gTotalTicks.load(std::memory_order_relaxed);
                 auto totalProc  = gTotalProcessed.load(std::memory_order_relaxed);
+                auto totalMrg   = gTotalMerges.load(std::memory_order_relaxed);
                 auto totalTime  = gTotalTimeUs.load(std::memory_order_relaxed);
                 auto maxTime    = gMaxTimeUs.load(std::memory_order_relaxed);
 
                 getLogger().info(
-                    "Stats (5s): frames={}, items/frame={:.1f}, "
+                    "Stats (5s): frames={}, items/frame={:.1f}, merges/frame={:.1f}, "
                     "avgTime={:.2f}ms, maxTime={:.2f}ms, threads={}",
                     totalTicks,
                     totalTicks ? static_cast<double>(totalProc) / totalTicks : 0.0,
+                    totalTicks ? static_cast<double>(totalMrg) / totalTicks : 0.0,
                     totalTicks ? static_cast<double>(totalTime) / totalTicks / 1000.0 : 0.0,
                     static_cast<double>(maxTime) / 1000.0,
                     gThreadPool ? gThreadPool->threadCount() : 0
@@ -251,6 +219,7 @@ void startStatsTask() {
 
                 gTotalTicks.store(0, std::memory_order_relaxed);
                 gTotalProcessed.store(0, std::memory_order_relaxed);
+                gTotalMerges.store(0, std::memory_order_relaxed);
                 gTotalTimeUs.store(0, std::memory_order_relaxed);
                 gMaxTimeUs.store(0, std::memory_order_relaxed);
             });
@@ -262,7 +231,26 @@ void startStatsTask() {
 void stopStatsTask() { gStatsRunning = false; }
 
 // ============================================================
-// Hook: Actor::$normalTick
+// Hook: ItemActor::_mergeWithNeighbours — 空间哈希替代
+// 在自定义阶段跳过（我们自己做合并）
+// 在原版阶段也跳过（已经合并过了）
+// ============================================================
+LL_TYPE_INSTANCE_HOOK(
+    MergeWithNeighboursHook,
+    ll::memory::HookPriority::Normal,
+    ItemActor,
+    &ItemActor::_mergeWithNeighbours,
+    void
+) {
+    if (gConfig.enabled) {
+        // 跳过原版合并，我们用空间哈希做
+        return;
+    }
+    origin();
+}
+
+// ============================================================
+// Hook: Actor::$normalTick — 跳过已处理的 ItemActor
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorNormalTickHook,
@@ -281,8 +269,8 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 并行阶段由工作线程调用，放行
-    if (gInParallelPhase.load(std::memory_order_acquire)) {
+    // 自定义阶段由主线程串行调用，放行
+    if (gInCustomPhase.load(std::memory_order_acquire)) {
         origin();
         return;
     }
@@ -296,65 +284,72 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// Hook: Actor::$remove — 并行阶段延迟
+// 空间哈希合并逻辑（主线程调用）
 // ============================================================
-LL_TYPE_INSTANCE_HOOK(
-    ActorRemoveHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::$remove,
-    void
-) {
-    if (gInParallelPhase.load(std::memory_order_acquire)) {
-        this->mRemoved = true;
-        Actor* self = this;
-        deferAction([self] { self->$remove(); });
-        return;
+struct ItemInfo {
+    ItemActor*   actor;
+    BlockSource* region;
+    float        x, y, z;
+};
+
+static size_t doSpatialMerge(std::vector<ItemInfo>& items) {
+    // 构建空间哈希
+    std::unordered_map<CellKey, std::vector<size_t>, CellKeyHash> grid;
+    grid.reserve(items.size());
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (items[i].actor->mRemoved) continue;
+        auto key = posToCell(items[i].x, items[i].y, items[i].z);
+        grid[key].push_back(i);
     }
-    origin();
+
+    size_t mergeCount = 0;
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        auto* a = items[i].actor;
+        if (a->mRemoved || a->isDead()) continue;
+
+        auto& stackA = a->item();
+        if (stackA.isNull()) continue;
+
+        int maxStack = stackA.getMaxStackSize();
+        if (stackA.getCount() >= maxStack) continue;
+
+        auto cellA = posToCell(items[i].x, items[i].y, items[i].z);
+
+        // 搜索 3x3x3 邻域
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    CellKey neighborKey{cellA.x + dx, cellA.y + dy, cellA.z + dz};
+                    auto it = grid.find(neighborKey);
+                    if (it == grid.end()) continue;
+
+                    for (size_t j : it->second) {
+                        if (j <= i) continue; // 避免重复
+                        auto* b = items[j].actor;
+                        if (b->mRemoved || b->isDead()) continue;
+
+                        // 调用原版合并
+                        if (a->_merge(b)) {
+                            mergeCount++;
+                            if (stackA.getCount() >= maxStack) goto nextItem;
+                        }
+                    }
+                }
+            }
+        }
+        nextItem:;
+    }
+
+    return mergeCount;
 }
 
 // ============================================================
-// Hook: Actor::$kill — 并行阶段延迟
-// ============================================================
-LL_TYPE_INSTANCE_HOOK(
-    ActorKillHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::$kill,
-    void
-) {
-    if (gInParallelPhase.load(std::memory_order_acquire)) {
-        this->mRemoved = true;
-        Actor* self = this;
-        deferAction([self] { self->$kill(); });
-        return;
-    }
-    origin();
-}
-
-// ============================================================
-// Hook: Actor::$die — 并行阶段延迟
-// ============================================================
-LL_TYPE_INSTANCE_HOOK(
-    ActorDieHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::$die,
-    void,
-    ::ActorDamageSource const& source
-) {
-    if (gInParallelPhase.load(std::memory_order_acquire)) {
-        this->mRemoved = true;
-        Actor* self = this;
-        deferAction([self] { self->$kill(); });
-        return;
-    }
-    origin(source);
-}
-
-// ============================================================
-// Hook: Level::$tick — 棋盘格并行
+// Hook: Level::$tick — 主逻辑
+// 策略：主线程串行 tick 所有 ItemActor（跳过原版合并）
+//       然后用空间哈希做合并
+//       然后并行处理 postNormalTick
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -372,71 +367,67 @@ LL_TYPE_INSTANCE_HOOK(
 
     clearTicked();
 
-    // 收集所有 ItemActor，按 chunk 分组
-    std::unordered_map<ChunkKey, std::vector<ItemEntry>, ChunkKeyHash> chunkMap;
+    // 收集 ItemActor
+    std::vector<ItemInfo> items;
+    items.reserve(512);
 
     auto actorList = getRuntimeActorList();
-    size_t totalCount = 0;
-
     for (Actor* actor : actorList) {
         if (!actor || actor->mRemoved) continue;
         if (actor->getEntityTypeId() != ActorType::ItemEntity) continue;
 
         auto*        itemActor = static_cast<ItemActor*>(actor);
         BlockSource& bs        = actor->getDimensionBlockSource();
-        auto         key       = getChunkKey(actor);
-
-        chunkMap[key].push_back({itemActor, &bs});
-        totalCount++;
+        auto&        pos       = actor->getPosition();
+        items.push_back({itemActor, &bs, pos.x, pos.y, pos.z});
     }
 
-    if (totalCount > 0) {
-        // 按棋盘格颜色分成两组 chunk
-        std::vector<std::vector<ItemEntry>*> color0Chunks;
-        std::vector<std::vector<ItemEntry>*> color1Chunks;
+    size_t count     = items.size();
+    size_t mergeCount = 0;
 
-        for (auto& [key, entries] : chunkMap) {
-            if (getChunkColor(key) == 0) {
-                color0Chunks.push_back(&entries);
-            } else {
-                color1Chunks.push_back(&entries);
-            }
+    if (count > 0) {
+        gInCustomPhase.store(true, std::memory_order_release);
+
+        // 阶段1：主线程串行 tick 所有 ItemActor
+        // _mergeWithNeighbours 被 hook 跳过，所以 tick 很快
+        for (auto& e : items) {
+            if (e.actor->mRemoved || e.actor->isDead()) continue;
+            e.actor->tick(*e.region);
+            markTicked(e.actor);
         }
 
-        // 处理一组 chunk 的 lambda
-        auto processChunks = [this](std::vector<std::vector<ItemEntry>*>& chunks) {
-            if (chunks.empty()) return;
+        // 更新位置（tick 后可能移动了）
+        for (auto& e : items) {
+            if (e.actor->mRemoved) continue;
+            auto& pos = e.actor->getPosition();
+            e.x = pos.x;
+            e.y = pos.y;
+            e.z = pos.z;
+        }
 
-            gInParallelPhase.store(true, std::memory_order_release);
+        // 阶段2：空间哈希合并（主线程，O(n) 替代 O(n²)）
+        mergeCount = doSpatialMerge(items);
 
-            // 每个 chunk 作为一个独立任务
-            std::vector<std::function<void()>> tasks;
-            tasks.reserve(chunks.size());
+        // 阶段3：并行 postNormalTick
+        // postNormalTick 主要做网络同步等轻量操作
+        std::vector<std::function<void()>> postTasks;
+        size_t batchSize = static_cast<size_t>(gConfig.batchSize);
+        for (size_t start = 0; start < count; start += batchSize) {
+            size_t end = std::min(start + batchSize, count);
+            postTasks.push_back([&items, start, end] {
+                for (size_t i = start; i < end; ++i) {
+                    if (items[i].actor->mRemoved) continue;
+                    items[i].actor->postNormalTick();
+                }
+            });
+        }
+        if (postTasks.size() > 1) {
+            gThreadPool->submitAndWait(postTasks);
+        } else if (!postTasks.empty()) {
+            postTasks[0]();
+        }
 
-            for (auto* chunkEntries : chunks) {
-                tasks.push_back([chunkEntries] {
-                    for (auto& e : *chunkEntries) {
-                        if (e.actor->mRemoved) continue;
-                        if (e.actor->isDead()) continue;
-
-                        e.actor->tick(*e.region);
-                        markTicked(e.actor);
-                    }
-                });
-            }
-
-            gThreadPool->submitAndWait(tasks);
-
-            gInParallelPhase.store(false, std::memory_order_release);
-
-            // 执行本轮延迟操作
-            executeDeferredActions();
-        };
-
-        // 第一轮：黑格
-        processChunks(color0Chunks);
-        // 第二轮：白格
-        processChunks(color1Chunks);
+        gInCustomPhase.store(false, std::memory_order_release);
     }
 
     // 原版 tick，已处理的 ItemActor 会被跳过
@@ -449,7 +440,8 @@ LL_TYPE_INSTANCE_HOOK(
     );
 
     gTotalTicks.fetch_add(1, std::memory_order_relaxed);
-    gTotalProcessed.fetch_add(totalCount, std::memory_order_relaxed);
+    gTotalProcessed.fetch_add(count, std::memory_order_relaxed);
+    gTotalMerges.fetch_add(mergeCount, std::memory_order_relaxed);
     gTotalTimeUs.fetch_add(elapsedUs, std::memory_order_relaxed);
 
     uint64_t curMax = gMaxTimeUs.load(std::memory_order_relaxed);
@@ -458,7 +450,10 @@ LL_TYPE_INSTANCE_HOOK(
         ;
 
     if (gConfig.debug) {
-        getLogger().info("Tick: {} items parallel, {:.2f}ms", totalCount, elapsedUs / 1000.0);
+        getLogger().info(
+            "Tick: {} items, {} merges, {:.2f}ms",
+            count, mergeCount, elapsedUs / 1000.0
+        );
     }
 }
 
@@ -499,21 +494,20 @@ bool ParallelItemTickMod::enable() {
 
     LevelTickHook::hook();
     ActorNormalTickHook::hook();
-    ActorRemoveHook::hook();
-    ActorKillHook::hook();
-    ActorDieHook::hook();
+    MergeWithNeighboursHook::hook();
 
     if (gConfig.stats) startStatsTask();
 
-    getLogger().info("Enabled — {} worker threads, checkerboard partitioning", threads);
+    getLogger().info(
+        "Enabled — {} threads, spatial hash merge, serial tick + parallel post",
+        threads
+    );
     return true;
 }
 
 bool ParallelItemTickMod::disable() {
     stopStatsTask();
-    ActorDieHook::unhook();
-    ActorKillHook::unhook();
-    ActorRemoveHook::unhook();
+    MergeWithNeighboursHook::unhook();
     ActorNormalTickHook::unhook();
     LevelTickHook::unhook();
     gThreadPool.reset();
