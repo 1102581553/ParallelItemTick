@@ -24,50 +24,14 @@ struct Config {
     bool enabled        = true;
     bool debug          = false;
     bool stats          = true;
-    int  minParallelCnt = 16;
-    int  workerThreads  = 0;
-    int  batchSize      = 64;
-};
-
-class TickWorkerPool {
-public:
-    explicit TickWorkerPool(int numWorkers);
-    ~TickWorkerPool();
-
-    TickWorkerPool(TickWorkerPool const&)            = delete;
-    TickWorkerPool& operator=(TickWorkerPool const&) = delete;
-
-    void parallelFor(size_t count, std::function<void(size_t)> const& func);
-
-    int getNumWorkers() const { return mNumWorkers; }
-
-private:
-    void workerMain();
-
-    int                      mNumWorkers;
-    std::vector<std::thread> mWorkers;
-
-    std::mutex              mMutex;
-    std::condition_variable mWorkCv;
-    std::condition_variable mDoneCv;
-
-    bool     mShutdown{false};
-    uint64_t mGeneration{0};
-
-    std::function<void(size_t)> const* mWorkFunc{nullptr};
-    size_t                             mWorkCount{0};
-    std::atomic<size_t>                mNextIndex{0};
-    int                                mActiveWorkers{0};
 };
 
 extern Config                          gConfig;
 extern std::shared_ptr<ll::io::Logger> gLogger;
 extern bool                            gStatsRunning;
-extern std::unique_ptr<TickWorkerPool> gWorkerPool;
 
 extern std::atomic<uint64_t> gTotalTicks;
 extern std::atomic<uint64_t> gTotalProcessed;
-extern std::atomic<uint64_t> gTotalMerged;
 extern std::atomic<uint64_t> gTotalTimeUs;
 extern std::atomic<uint64_t> gMaxTimeUs;
 
