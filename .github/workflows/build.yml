@@ -39,22 +39,6 @@ jobs:
           restore-keys: |
             pkgs-
 
-      - name: Clean output
-        run: |
-          foreach ($dir in @("bin", "build")) {
-            if (Test-Path $dir) {
-              Write-Host "Found existing $dir directory, listing contents:"
-              Get-ChildItem -Recurse $dir | ForEach-Object {
-                Write-Host "  $($_.FullName) ($([math]::Round($_.Length / 1KB, 2)) KB, $($_.LastWriteTime))"
-              }
-              Remove-Item -Recurse -Force $dir
-              Write-Host "$dir directory removed."
-            } else {
-              Write-Host "$dir directory does not exist, nothing to clean."
-            }
-          }
-        shell: pwsh
-
       - name: Build
         run: |
           xmake f -a x64 -m release -p windows -y
