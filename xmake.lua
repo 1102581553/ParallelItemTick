@@ -36,5 +36,13 @@ target("ParallelItemTick")
 
     add_syslinks("shlwapi", "advapi32")
 
-    set_targetdir("build")
+    set_targetdir("bin")
     set_runtimes("MD")
+
+    before_build(function (target)
+        local bindir = path.join(os.projectdir(), "bin", target:name())
+        if os.isdir(bindir) then
+            print("[Clean]: Removing old mod output: " .. bindir)
+            os.rmdir(bindir)
+        end
+    end)
