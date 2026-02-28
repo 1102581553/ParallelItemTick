@@ -9,6 +9,7 @@
 #include <queue>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -51,21 +52,21 @@ public:
         }
     }
 
-    void parallelFor(size_t count, size_t batchSize, std::function<void(size_t, size_t)> func) {
-        if (count == 0) return;
+    // 提交 N 个独立任务，等待全部完成
+    void submitAndWait(std::vector<std::function<void()>>& tasks) {
+        if (tasks.empty()) return;
 
-        std::atomic<size_t>     completedBatches{0};
-        size_t                  totalBatches = (count + batchSize - 1) / batchSize;
+        std::atomic<size_t>     completed{0};
+        size_t                  total = tasks.size();
         std::mutex              doneMutex;
         std::condition_variable doneCv;
 
-        for (size_t batchStart = 0; batchStart < count; batchStart += batchSize) {
-            size_t batchEnd = std::min(batchStart + batchSize, count);
+        for (auto& task : tasks) {
             {
                 std::unique_lock lock(mMutex);
-                mTasks.push([&func, &completedBatches, &doneCv, batchStart, batchEnd] {
-                    func(batchStart, batchEnd);
-                    completedBatches.fetch_add(1, std::memory_order_release);
+                mTasks.push([&task, &completed, &doneCv] {
+                    task();
+                    completed.fetch_add(1, std::memory_order_release);
                     doneCv.notify_one();
                 });
             }
@@ -74,7 +75,7 @@ public:
 
         std::unique_lock lock(doneMutex);
         doneCv.wait(lock, [&] {
-            return completedBatches.load(std::memory_order_acquire) >= totalBatches;
+            return completed.load(std::memory_order_acquire) >= total;
         });
     }
 
@@ -105,14 +106,8 @@ private:
 static std::unique_ptr<ThreadPool> gThreadPool;
 
 // ============================================================
-// 全局并行锁
-// 并行阶段：主线程持有独占锁（阻止其他线程修改实体）
-//           工作线程安全执行（主线程在 parallelFor 中等待）
-// 实体销毁：需要获取独占锁（如果并行阶段正在进行则等待）
-// ============================================================
-std::shared_mutex gParallelMutex;
-
 // 并行阶段标志
+// ============================================================
 static std::atomic<bool> gInParallelPhase{false};
 
 // ============================================================
@@ -156,6 +151,41 @@ static bool wasTicked(const Actor* item) {
 static void clearTicked() {
     std::lock_guard lock(gTickedMutex);
     gTickedItems.clear();
+}
+
+// ============================================================
+// 空间分区 — 棋盘格模式
+// 将世界按 chunk（16x16）分区，用棋盘格着色
+// 同一颜色的 chunk 之间至少隔一个 chunk，不会互相影响
+// 分两轮执行：先黑格并行，再白格并行
+// ============================================================
+struct ChunkKey {
+    int x, z;
+    bool operator==(const ChunkKey& o) const { return x == o.x && z == o.z; }
+};
+
+struct ChunkKeyHash {
+    size_t operator()(const ChunkKey& k) const {
+        return std::hash<int64_t>()(static_cast<int64_t>(k.x) << 32 | static_cast<uint32_t>(k.z));
+    }
+};
+
+struct ItemEntry {
+    ItemActor*   actor;
+    BlockSource* region;
+};
+
+static ChunkKey getChunkKey(const Actor* actor) {
+    auto& pos = actor->getPosition();
+    return {
+        static_cast<int>(std::floor(pos.x)) >> 4,
+        static_cast<int>(std::floor(pos.z)) >> 4
+    };
+}
+
+// 棋盘格颜色：(chunkX + chunkZ) % 2
+static int getChunkColor(const ChunkKey& key) {
+    return ((key.x % 2 + 2) % 2 + (key.z % 2 + 2) % 2) % 2;
 }
 
 // ============================================================
@@ -232,7 +262,7 @@ void startStatsTask() {
 void stopStatsTask() { gStatsRunning = false; }
 
 // ============================================================
-// Hook: Actor::$normalTick — 拦截 ItemActor
+// Hook: Actor::$normalTick
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorNormalTickHook,
@@ -251,13 +281,13 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 并行阶段由工作线程调用，直接执行
+    // 并行阶段由工作线程调用，放行
     if (gInParallelPhase.load(std::memory_order_acquire)) {
         origin();
         return;
     }
 
-    // 原版阶段，跳过已并行处理的
+    // 原版阶段，跳过已处理的
     if (wasTicked(this)) {
         return;
     }
@@ -266,7 +296,7 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// Hook: Actor::$remove — 并行阶段延迟销毁
+// Hook: Actor::$remove — 并行阶段延迟
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorRemoveHook,
@@ -276,19 +306,16 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     if (gInParallelPhase.load(std::memory_order_acquire)) {
-        // 并行阶段：标记移除，延迟真正销毁
         this->mRemoved = true;
         Actor* self = this;
-        deferAction([self] {
-            self->$remove();
-        });
+        deferAction([self] { self->$remove(); });
         return;
     }
     origin();
 }
 
 // ============================================================
-// Hook: Actor::kill — 并行阶段延迟 kill
+// Hook: Actor::$kill — 并行阶段延迟
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorKillHook,
@@ -300,16 +327,14 @@ LL_TYPE_INSTANCE_HOOK(
     if (gInParallelPhase.load(std::memory_order_acquire)) {
         this->mRemoved = true;
         Actor* self = this;
-        deferAction([self] {
-            self->$kill();
-        });
+        deferAction([self] { self->$kill(); });
         return;
     }
     origin();
 }
 
 // ============================================================
-// Hook: Actor::die — 并行阶段延迟 die
+// Hook: Actor::$die — 并行阶段延迟
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorDieHook,
@@ -321,19 +346,15 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     if (gInParallelPhase.load(std::memory_order_acquire)) {
         this->mRemoved = true;
-        Actor*                    self = this;
-        // 复制 source，因为引用可能在延迟执行时失效
-        // ActorDamageSource 可能不可复制，所以只延迟 kill
-        deferAction([self] {
-            self->$kill();
-        });
+        Actor* self = this;
+        deferAction([self] { self->$kill(); });
         return;
     }
     origin(source);
 }
 
 // ============================================================
-// Hook: Level::$tick — 主逻辑
+// Hook: Level::$tick — 棋盘格并行
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -351,56 +372,74 @@ LL_TYPE_INSTANCE_HOOK(
 
     clearTicked();
 
-    struct ItemEntry {
-        ItemActor*   actor;
-        BlockSource* region;
-    };
-
-    std::vector<ItemEntry> items;
-    items.reserve(512);
+    // 收集所有 ItemActor，按 chunk 分组
+    std::unordered_map<ChunkKey, std::vector<ItemEntry>, ChunkKeyHash> chunkMap;
 
     auto actorList = getRuntimeActorList();
+    size_t totalCount = 0;
+
     for (Actor* actor : actorList) {
         if (!actor || actor->mRemoved) continue;
         if (actor->getEntityTypeId() != ActorType::ItemEntity) continue;
 
         auto*        itemActor = static_cast<ItemActor*>(actor);
         BlockSource& bs        = actor->getDimensionBlockSource();
-        items.push_back({itemActor, &bs});
+        auto         key       = getChunkKey(actor);
+
+        chunkMap[key].push_back({itemActor, &bs});
+        totalCount++;
     }
 
-    size_t count = items.size();
+    if (totalCount > 0) {
+        // 按棋盘格颜色分成两组 chunk
+        std::vector<std::vector<ItemEntry>*> color0Chunks;
+        std::vector<std::vector<ItemEntry>*> color1Chunks;
 
-    if (count > 0) {
-        // 获取独占锁，阻止其他线程（命令处理等）修改实体
-        // 注意：此时我们在主线程，命令也在主线程，所以不会死锁
-        // 但异步命令或其他线程的操作会被阻塞
-        gInParallelPhase.store(true, std::memory_order_release);
-
-        gThreadPool->parallelFor(
-            count,
-            static_cast<size_t>(gConfig.batchSize),
-            [&items](size_t begin, size_t end) {
-                for (size_t i = begin; i < end; ++i) {
-                    auto& e = items[i];
-                    // 双重检查：可能在其他批次中被标记移除
-                    if (e.actor->mRemoved) continue;
-                    if (e.actor->isDead()) continue;
-
-                    e.actor->tick(*e.region);
-
-                    markTicked(e.actor);
-                }
+        for (auto& [key, entries] : chunkMap) {
+            if (getChunkColor(key) == 0) {
+                color0Chunks.push_back(&entries);
+            } else {
+                color1Chunks.push_back(&entries);
             }
-        );
+        }
 
-        gInParallelPhase.store(false, std::memory_order_release);
+        // 处理一组 chunk 的 lambda
+        auto processChunks = [this](std::vector<std::vector<ItemEntry>*>& chunks) {
+            if (chunks.empty()) return;
 
-        // 执行延迟操作
-        executeDeferredActions();
+            gInParallelPhase.store(true, std::memory_order_release);
+
+            // 每个 chunk 作为一个独立任务
+            std::vector<std::function<void()>> tasks;
+            tasks.reserve(chunks.size());
+
+            for (auto* chunkEntries : chunks) {
+                tasks.push_back([chunkEntries] {
+                    for (auto& e : *chunkEntries) {
+                        if (e.actor->mRemoved) continue;
+                        if (e.actor->isDead()) continue;
+
+                        e.actor->tick(*e.region);
+                        markTicked(e.actor);
+                    }
+                });
+            }
+
+            gThreadPool->submitAndWait(tasks);
+
+            gInParallelPhase.store(false, std::memory_order_release);
+
+            // 执行本轮延迟操作
+            executeDeferredActions();
+        };
+
+        // 第一轮：黑格
+        processChunks(color0Chunks);
+        // 第二轮：白格
+        processChunks(color1Chunks);
     }
 
-    // 原版 tick
+    // 原版 tick，已处理的 ItemActor 会被跳过
     origin();
 
     auto elapsedUs = static_cast<uint64_t>(
@@ -410,7 +449,7 @@ LL_TYPE_INSTANCE_HOOK(
     );
 
     gTotalTicks.fetch_add(1, std::memory_order_relaxed);
-    gTotalProcessed.fetch_add(count, std::memory_order_relaxed);
+    gTotalProcessed.fetch_add(totalCount, std::memory_order_relaxed);
     gTotalTimeUs.fetch_add(elapsedUs, std::memory_order_relaxed);
 
     uint64_t curMax = gMaxTimeUs.load(std::memory_order_relaxed);
@@ -419,7 +458,7 @@ LL_TYPE_INSTANCE_HOOK(
         ;
 
     if (gConfig.debug) {
-        getLogger().info("Tick: {} items parallel, {:.2f}ms", count, elapsedUs / 1000.0);
+        getLogger().info("Tick: {} items parallel, {:.2f}ms", totalCount, elapsedUs / 1000.0);
     }
 }
 
@@ -466,7 +505,7 @@ bool ParallelItemTickMod::enable() {
 
     if (gConfig.stats) startStatsTask();
 
-    getLogger().info("Enabled — {} worker threads, batch size {}", threads, gConfig.batchSize);
+    getLogger().info("Enabled — {} worker threads, checkerboard partitioning", threads);
     return true;
 }
 
