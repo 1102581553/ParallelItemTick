@@ -145,35 +145,29 @@ std::atomic<uint64_t> gMaxTimeUs{0};
 static std::atomic<bool> gInCustomPhase{false};
 static uint64_t          gFrameCounter = 0;
 
-// 无锁已处理集合：用简单的 bool 数组 + 全局 generation 计数
-// 每帧递增 generation，normalTick hook 检查 actor 的 tickCount 是否匹配
-// 不需要任何锁
-static std::atomic<uint64_t> gTickGeneration{0};
-
-// 存储每个已处理 actor 的 UniqueID，用排序数组做二分查找（无锁，只在主线程写）
-static std::vector<int64_t> gTickedIdsSorted;
-static bool                 gTickedIdsDirty = false;
+// 无锁已处理集合：用指针地址，避免调用 getOrCreateUniqueID
+static std::vector<const Actor*> gTickedActorsSorted;
+static bool                      gTickedActorsDirty = false;
 
 static void clearTicked() {
-    gTickedIdsSorted.clear();
-    gTickedIdsDirty = false;
+    gTickedActorsSorted.clear();
+    gTickedActorsDirty = false;
 }
 
-static void markTicked(int64_t id) {
-    gTickedIdsSorted.push_back(id);
-    gTickedIdsDirty = true;
+static void markTicked(const Actor* actor) {
+    gTickedActorsSorted.push_back(actor);
+    gTickedActorsDirty = true;
 }
 
 static void finalizeTicked() {
-    if (gTickedIdsDirty) {
-        std::sort(gTickedIdsSorted.begin(), gTickedIdsSorted.end());
-        gTickedIdsDirty = false;
+    if (gTickedActorsDirty) {
+        std::sort(gTickedActorsSorted.begin(), gTickedActorsSorted.end());
+        gTickedActorsDirty = false;
     }
 }
 
-static bool wasTicked(int64_t id) {
-    // 二分查找，无锁
-    return std::binary_search(gTickedIdsSorted.begin(), gTickedIdsSorted.end(), id);
+static bool wasTicked(const Actor* actor) {
+    return std::binary_search(gTickedActorsSorted.begin(), gTickedActorsSorted.end(), actor);
 }
 
 ll::io::Logger& getLogger() {
@@ -258,7 +252,6 @@ LL_TYPE_INSTANCE_HOOK(
 
 // ============================================================
 // Hook: Actor::$normalTick — 跳过已处理的 ItemActor
-// 只在主线程调用，无需锁
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorNormalTickHook,
@@ -277,21 +270,18 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 自定义阶段放行
     if (gInCustomPhase.load(std::memory_order_acquire)) {
         origin();
         return;
     }
 
-    // 已移除的让原版处理
     if (this->mRemoved) {
         origin();
         return;
     }
 
-    // 检查是否已处理（无锁二分查找）
-    auto uid = this->getOrCreateUniqueID();
-    if (wasTicked(uid.rawID)) {
+    // 直接用指针检查，不调用 getOrCreateUniqueID
+    if (wasTicked(this)) {
         return;
     }
 
@@ -309,7 +299,6 @@ struct MergePair {
 
 struct ItemInfo {
     ItemActor* actor;
-    int64_t    uid;
     float      x, y, z;
 };
 
@@ -446,9 +435,8 @@ LL_TYPE_INSTANCE_HOOK(
         if (actor->getEntityTypeId() != ActorType::ItemEntity) continue;
 
         auto* itemActor = static_cast<ItemActor*>(actor);
-        auto  uid       = actor->getOrCreateUniqueID();
         auto& pos       = actor->getPosition();
-        items.push_back({itemActor, uid.rawID, pos.x, pos.y, pos.z});
+        items.push_back({itemActor, pos.x, pos.y, pos.z});
     }
 
     size_t count      = items.size();
@@ -458,15 +446,15 @@ LL_TYPE_INSTANCE_HOOK(
     if (count > 0) {
         gInCustomPhase.store(true, std::memory_order_release);
 
-        // 阶段1：主线程串行 tick
+        // 阶段1：主线程串行 tick（_mergeWithNeighbours 被跳过）
         for (auto& e : items) {
             if (e.actor->mRemoved || e.actor->isDead()) continue;
             BlockSource& bs = e.actor->getDimensionBlockSource();
             e.actor->tick(bs);
-            markTicked(e.uid);
+            markTicked(e.actor);
         }
 
-        // 排序已处理 ID 列表（为 origin() 阶段的二分查找准备）
+        // 排序已处理指针列表
         finalizeTicked();
 
         // 阶段2：每 mergeInterval 帧做一次合并
@@ -572,9 +560,8 @@ bool ParallelItemTickMod::load() {
         saveConfig();
     }
     getLogger().info(
-        "Loaded. enabled={}, debug={}, stats={}, threads={}, mergeInterval={}, maxMerges={}",
-        gConfig.enabled, gConfig.debug, gConfig.stats,
-        gConfig.numThreads, gConfig.mergeInterval, gConfig.maxMergesPerFrame
+        "Loaded. enabled={}, debug={}, stats={}, threads={}",
+        gConfig.enabled, gConfig.debug, gConfig.stats, gConfig.numThreads
     );
     return true;
 }
