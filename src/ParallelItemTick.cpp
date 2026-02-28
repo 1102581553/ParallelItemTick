@@ -12,7 +12,7 @@
 #include <ll/api/thread/ServerThreadExecutor.h>
 
 // Minecraft 必要头文件
-#include <mc/deps/ecs/EntityRegistry.h>
+#include <mc/deps/ecs/gamerefs_entity/EntityRegistry.h>
 #include <mc/deps/ecs/gamerefs_entity/EntityContext.h>   // 需确认构造函数存在
 #include <mc/deps/vanilla_components/ItemActorFlagComponent.h>
 #include <mc/entity/components/ActorTickNeededComponent.h>
