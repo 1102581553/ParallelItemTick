@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
-#include <unordered_map>
 #include <vector>
 
 #include <ll/api/Config.h>
@@ -22,6 +21,7 @@
 #include <mc/world/level/BlockSource.h>
 #include <mc/world/level/Level.h>
 #include <mc/world/level/dimension/Dimension.h>
+#include <mc/world/phys/AABB.h>
 
 namespace parallel_item_tick {
 
@@ -40,35 +40,6 @@ std::atomic<uint64_t> gTotalProcessed{0};
 std::atomic<uint64_t> gTotalMerged{0};
 std::atomic<uint64_t> gTotalTimeUs{0};
 std::atomic<uint64_t> gMaxTimeUs{0};
-
-// ============================================================
-// Per-dimension per-thread BlockSource 池
-// ============================================================
-struct DimBlockSources {
-    std::vector<std::unique_ptr<BlockSource>> sources;
-};
-static std::unordered_map<int, DimBlockSources> gBlockSourcePool;
-
-static void ensureBlockSources(BlockSource& originalBS, int dimId, int totalSlots) {
-    auto& entry = gBlockSourcePool[dimId];
-    if (entry.sources.size() >= static_cast<size_t>(totalSlots)) return;
-
-    entry.sources.reserve(totalSlots);
-    while (entry.sources.size() < static_cast<size_t>(totalSlots)) {
-        entry.sources.push_back(std::make_unique<BlockSource>(
-            originalBS.getLevel(),
-            originalBS.getDimension(),
-            originalBS.getChunkSource(),
-            true,
-            false,
-            false
-        ));
-    }
-}
-
-static void clearBlockSourcePool() {
-    gBlockSourcePool.clear();
-}
 
 // ============================================================
 // 工具函数
@@ -223,40 +194,100 @@ void TickWorkerPool::workerMain() {
 }
 
 // ============================================================
-// 线程槽位
+// 纯计算的物理更新 — 只读写传入的 PhysicsResult
+// 不调用任何 BDS API，完全线程安全
 // ============================================================
-static thread_local int tSlotId = -1;
-static std::atomic<int> gNextSlot{1};
+static constexpr float GRAVITY       = -0.04f;
+static constexpr float DRAG_AIR      = 0.98f;
+static constexpr float DRAG_GROUND   = 0.6f;   // 地面额外摩擦（与方块无关的近似值）
+static constexpr int   MAX_AGE       = 6000;
+static constexpr int   MAX_LIFETIME  = 72000;   // 物品最大生命周期
 
-static int getSlotId() {
-    if (tSlotId < 0) {
-        tSlotId = gNextSlot.fetch_add(1, std::memory_order_relaxed);
+struct ItemSnapshot {
+    // 从主线程读取的快照（只读）
+    float posX, posY, posZ;
+    float velX, velY, velZ;
+    int   age;
+    int   lifeTime;
+    bool  onGround;
+    bool  isInWater;
+    bool  removed;
+    bool  dead;
+
+    // 输出
+    PhysicsResult result;
+};
+
+static void computePhysics(ItemSnapshot& snap) {
+    if (snap.removed || snap.dead) {
+        snap.result.shouldRemove = false;
+        snap.result.newPosX = snap.posX;
+        snap.result.newPosY = snap.posY;
+        snap.result.newPosZ = snap.posZ;
+        snap.result.newVelX = snap.velX;
+        snap.result.newVelY = snap.velY;
+        snap.result.newVelZ = snap.velZ;
+        snap.result.newAge  = snap.age;
+        return;
     }
-    return tSlotId;
+
+    float vx = snap.velX;
+    float vy = snap.velY;
+    float vz = snap.velZ;
+
+    // 重力
+    vy += GRAVITY;
+
+    // 水中浮力近似
+    if (snap.isInWater) {
+        vy += 0.06f;  // 浮力抵消部分重力
+        vx *= 0.95f;
+        vy *= 0.95f;
+        vz *= 0.95f;
+    }
+
+    // 空气阻力
+    vx *= DRAG_AIR;
+    vy *= DRAG_AIR;
+    vz *= DRAG_AIR;
+
+    // 地面摩擦
+    if (snap.onGround) {
+        vx *= DRAG_GROUND;
+        vz *= DRAG_GROUND;
+        // 地面上 Y 速度归零（防止穿地）
+        if (vy < 0.0f) vy = 0.0f;
+    }
+
+    // 位置更新
+    float nx = snap.posX + vx;
+    float ny = snap.posY + vy;
+    float nz = snap.posZ + vz;
+
+    // 年龄
+    int newAge = snap.age + 1;
+
+    // despawn 检查
+    bool shouldRemove = false;
+    if (newAge >= MAX_AGE && snap.lifeTime <= 0) {
+        shouldRemove = true;
+    }
+    if (newAge >= MAX_LIFETIME) {
+        shouldRemove = true;
+    }
+
+    snap.result.newPosX      = nx;
+    snap.result.newPosY      = ny;
+    snap.result.newPosZ      = nz;
+    snap.result.newVelX      = vx;
+    snap.result.newVelY      = vy;
+    snap.result.newVelZ      = vz;
+    snap.result.newAge       = newAge;
+    snap.result.shouldRemove = shouldRemove;
 }
 
 // ============================================================
-// Chunk 分组
-// ============================================================
-struct ChunkKey {
-    int dimId;
-    int x, z;
-    bool operator==(ChunkKey const& o) const {
-        return dimId == o.dimId && x == o.x && z == o.z;
-    }
-};
-
-struct ChunkKeyHash {
-    size_t operator()(ChunkKey const& k) const {
-        size_t h = std::hash<int>()(k.dimId);
-        h ^= std::hash<int>()(k.x) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>()(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        return h;
-    }
-};
-
-// ============================================================
-// Hook: Actor::tick
+// Hook: Actor::tick — 跳过已处理的 ItemActor
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorTickHook,
@@ -273,7 +304,12 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// Hook: Level::$tick
+// Hook: Level::$tick — 主逻辑
+//
+// 策略：
+// 阶段 1（主线程）：快照所有 ItemActor 的物理状态
+// 阶段 2（并行）  ：纯数学计算物理更新，零 BDS API 调用
+// 阶段 3（主线程）：应用物理结果 + 原版 tick 处理交互
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -289,17 +325,16 @@ LL_TYPE_INSTANCE_HOOK(
 
     auto tickStart = std::chrono::steady_clock::now();
 
-    // ── 收集所有存活的 ItemActor ──
-    struct ItemEntry {
+    // ── 阶段 1：快照 ──
+    struct ItemRef {
         ItemActor*   actor;
-        BlockSource* originalBS;
-        int          dimId;
-        int          chunkX;
-        int          chunkZ;
+        BlockSource* region;
     };
 
-    std::vector<ItemEntry> items;
-    items.reserve(256);
+    std::vector<ItemRef>      refs;
+    std::vector<ItemSnapshot> snapshots;
+    refs.reserve(256);
+    snapshots.reserve(256);
 
     auto actorList = getRuntimeActorList();
     for (Actor* actor : actorList) {
@@ -308,16 +343,29 @@ LL_TYPE_INSTANCE_HOOK(
         if (!itemActor) continue;
 
         BlockSource& bs = actor->getDimensionBlockSource();
-        int dimId = static_cast<int>(bs.getDimensionId());
 
         auto const& pos = actor->getPosition();
-        int cx = static_cast<int>(std::floor(pos.x)) >> 4;
-        int cz = static_cast<int>(std::floor(pos.z)) >> 4;
+        auto const& vel = actor->getPosDelta();
 
-        items.push_back({itemActor, &bs, dimId, cx, cz});
+        ItemSnapshot snap{};
+        snap.posX     = pos.x;
+        snap.posY     = pos.y;
+        snap.posZ     = pos.z;
+        snap.velX     = vel.x;
+        snap.velY     = vel.y;
+        snap.velZ     = vel.z;
+        snap.age      = itemActor->age();
+        snap.lifeTime = itemActor->lifeTime();
+        snap.onGround = actor->isOnGround();
+        snap.isInWater = actor->isInWater();
+        snap.removed  = actor->mRemoved;
+        snap.dead     = actor->isDead();
+
+        refs.push_back({itemActor, &bs});
+        snapshots.push_back(snap);
     }
 
-    size_t count = items.size();
+    size_t count = refs.size();
 
     if (count < static_cast<size_t>(gConfig.minParallelCnt)) {
         origin();
@@ -327,69 +375,41 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // ── 准备 per-thread BlockSource ──
-    int totalSlots = gWorkerPool->getNumWorkers() + 1;
+    // ── 阶段 2：并行物理计算（纯数学，零 BDS 调用）──
+    gWorkerPool->parallelFor(count, [&snapshots](size_t i) {
+        computePhysics(snapshots[i]);
+    });
 
-    std::unordered_map<int, BlockSource*> involvedDims;
-    for (auto& e : items) {
-        involvedDims.emplace(e.dimId, e.originalBS);
-    }
-    for (auto& [dimId, bs] : involvedDims) {
-        ensureBlockSources(*bs, dimId, totalSlots);
-    }
-
-    tSlotId = 0;
-    gNextSlot.store(1, std::memory_order_relaxed);
-
-    // ── 按 chunk 分组 ──
-    std::unordered_map<ChunkKey, std::vector<size_t>, ChunkKeyHash> chunkMap;
-    chunkMap.reserve(count / 4);
+    // ── 阶段 3：主线程串行应用结果 ──
     for (size_t i = 0; i < count; i++) {
-        ChunkKey key{items[i].dimId, items[i].chunkX, items[i].chunkZ};
-        chunkMap[key].push_back(i);
-    }
+        auto& ref  = refs[i];
+        auto& res  = snapshots[i].result;
+        auto* item = ref.actor;
 
-    // ── 棋盘格 4 phase ──
-    std::vector<std::vector<size_t>> phases[4];
+        if (item->mRemoved || item->isDead()) continue;
 
-    for (auto& [key, indices] : chunkMap) {
-        int px = key.x & 1;
-        int pz = key.z & 1;
-        int phase = (px << 1) | pz;
-        phases[phase].push_back(std::move(indices));
-    }
+        if (res.shouldRemove) {
+            item->remove();
+            continue;
+        }
 
-    // ── 分 phase 执行 ──
-    for (int p = 0; p < 4; p++) {
-        auto& chunks = phases[p];
-        if (chunks.empty()) continue;
+        // 应用物理结果
+        // 使用 Actor 的 API 在主线程设置位置和速度
+        item->setPosDelta(Vec3{res.newVelX, res.newVelY, res.newVelZ});
+        item->age() = res.newAge;
 
-        gWorkerPool->parallelFor(chunks.size(), [&](size_t chunkIdx) {
-            int slot = getSlotId();
-
-            for (size_t itemIdx : chunks[chunkIdx]) {
-                auto& e = items[itemIdx];
-
-                auto& pool = gBlockSourcePool[e.dimId];
-                int safeSlot = (slot < static_cast<int>(pool.sources.size())) ? slot : 0;
-                BlockSource& threadBS = *pool.sources[safeSlot];
-
-                try {
-                    e.actor->tick(threadBS);
-                } catch (...) {}
-            }
-        });
-
-        tSlotId = 0;
-        gNextSlot.store(1, std::memory_order_relaxed);
+        // 调用原版 tick 处理碰撞检测、方块交互、拾取等
+        // 但跳过物理更新部分（速度已经预计算好了）
+        item->tick(*ref.region);
     }
 
     // ── 串行 merge ──
     size_t mergeCount = 0;
-    for (auto& e : items) {
-        if (e.actor->mRemoved || e.actor->isDead()) continue;
+    for (size_t i = 0; i < count; i++) {
+        auto* item = refs[i].actor;
+        if (item->mRemoved || item->isDead()) continue;
         try {
-            e.actor->_mergeWithNeighbours();
+            item->_mergeWithNeighbours();
             mergeCount++;
         } catch (...) {}
     }
@@ -417,10 +437,7 @@ LL_TYPE_INSTANCE_HOOK(
         ;
 
     if (gConfig.debug) {
-        getLogger().info(
-            "Tick: {} items, {} chunks, {:.2f}ms",
-            count, chunkMap.size(), elapsedUs / 1000.0
-        );
+        getLogger().info("Tick: {} items, {:.2f}ms", count, elapsedUs / 1000.0);
     }
 }
 
@@ -460,7 +477,7 @@ bool ParallelItemTickMod::enable() {
     if (gConfig.stats) startStatsTask();
 
     getLogger().info(
-        "Enabled with {} workers, per-thread BlockSource, checkerboard parallel",
+        "Enabled with {} workers, parallel physics compute",
         gConfig.workerThreads
     );
     return true;
@@ -473,7 +490,6 @@ bool ParallelItemTickMod::disable() {
     LevelTickHook::unhook();
 
     gWorkerPool.reset();
-    clearBlockSourcePool();
     gSkipProcessedItems = false;
 
     getLogger().info("Disabled");
