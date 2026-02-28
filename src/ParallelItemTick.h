@@ -6,9 +6,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 #include <ll/api/Config.h>
@@ -17,9 +15,6 @@
 namespace ll::io {
 class Logger;
 }
-
-class BlockSource;
-class Dimension;
 
 namespace parallel_item_tick {
 
@@ -32,6 +27,7 @@ struct Config {
     int  workerThreads  = 0;
 };
 
+// 使用 mutex+condvar 的安全线程池
 class TickWorkerPool {
 public:
     explicit TickWorkerPool(int numWorkers);
@@ -40,9 +36,8 @@ public:
     TickWorkerPool(TickWorkerPool const&)            = delete;
     TickWorkerPool& operator=(TickWorkerPool const&) = delete;
 
+    // 并行执行 count 个任务，全部完成后返回
     void parallelFor(size_t count, std::function<void(size_t)> const& func);
-
-    int getNumWorkers() const { return mNumWorkers; }
 
 private:
     void workerMain();
@@ -51,16 +46,14 @@ private:
     std::vector<std::thread> mWorkers;
 
     std::mutex              mMutex;
-    std::condition_variable mWorkCv;
-    std::condition_variable mDoneCv;
-
-    bool     mShutdown{false};
-    uint64_t mGeneration{0};
+    std::condition_variable mCvWork;   // 通知工作线程有任务
+    std::condition_variable mCvDone;   // 通知主线程任务完成
 
     std::function<void(size_t)> const* mWorkFunc{nullptr};
-    size_t                             mWorkCount{0};
     std::atomic<size_t>                mNextIndex{0};
-    int                                mActiveWorkers{0};
+    size_t                             mWorkCount{0};
+    int                                mActiveworkers{0}; // 还在工作的线程数
+    bool                               mShutdown{false};
 };
 
 extern Config                          gConfig;
@@ -68,7 +61,8 @@ extern std::shared_ptr<ll::io::Logger> gLogger;
 extern bool                            gStatsRunning;
 extern std::unique_ptr<TickWorkerPool> gWorkerPool;
 
-extern bool gSkipProcessedItems;
+extern thread_local bool gSuppressMerge;
+extern bool              gSkipProcessedItems;
 
 extern std::atomic<uint64_t> gTotalTicks;
 extern std::atomic<uint64_t> gTotalProcessed;
