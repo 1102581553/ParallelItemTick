@@ -106,7 +106,7 @@ private:
 static std::unique_ptr<ThreadPool> gThreadPool;
 
 // ============================================================
-// 空间哈希 — 用于 O(1) 合并查找
+// 空间哈希
 // ============================================================
 struct CellKey {
     int x, y, z;
@@ -122,7 +122,6 @@ struct CellKeyHash {
     }
 };
 
-// 每个 cell 是 1x1x1 方块
 static CellKey posToCell(float x, float y, float z) {
     return {
         static_cast<int>(std::floor(x)),
@@ -144,10 +143,8 @@ std::atomic<uint64_t> gTotalMerges{0};
 std::atomic<uint64_t> gTotalTimeUs{0};
 std::atomic<uint64_t> gMaxTimeUs{0};
 
-// 标记是否在我们的自定义 tick 阶段
 static std::atomic<bool> gInCustomPhase{false};
 
-// 已处理集合
 static std::mutex                       gTickedMutex;
 static std::unordered_set<const Actor*> gTickedItems;
 
@@ -231,9 +228,7 @@ void startStatsTask() {
 void stopStatsTask() { gStatsRunning = false; }
 
 // ============================================================
-// Hook: ItemActor::_mergeWithNeighbours — 空间哈希替代
-// 在自定义阶段跳过（我们自己做合并）
-// 在原版阶段也跳过（已经合并过了）
+// Hook: ItemActor::_mergeWithNeighbours — 跳过原版合并
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     MergeWithNeighboursHook,
@@ -243,7 +238,6 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     if (gConfig.enabled) {
-        // 跳过原版合并，我们用空间哈希做
         return;
     }
     origin();
@@ -269,13 +263,11 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 自定义阶段由主线程串行调用，放行
     if (gInCustomPhase.load(std::memory_order_acquire)) {
         origin();
         return;
     }
 
-    // 原版阶段，跳过已处理的
     if (wasTicked(this)) {
         return;
     }
@@ -284,7 +276,7 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// 空间哈希合并逻辑（主线程调用）
+// 空间哈希合并
 // ============================================================
 struct ItemInfo {
     ItemActor*   actor;
@@ -293,7 +285,6 @@ struct ItemInfo {
 };
 
 static size_t doSpatialMerge(std::vector<ItemInfo>& items) {
-    // 构建空间哈希
     std::unordered_map<CellKey, std::vector<size_t>, CellKeyHash> grid;
     grid.reserve(items.size());
 
@@ -312,12 +303,11 @@ static size_t doSpatialMerge(std::vector<ItemInfo>& items) {
         auto& stackA = a->item();
         if (stackA.isNull()) continue;
 
-        int maxStack = stackA.getMaxStackSize();
-        if (stackA.getCount() >= maxStack) continue;
+        int maxStack = static_cast<int>(stackA.getMaxStackSize());
+        if (static_cast<int>(stackA.mCount) >= maxStack) continue;
 
         auto cellA = posToCell(items[i].x, items[i].y, items[i].z);
 
-        // 搜索 3x3x3 邻域
         for (int dx = -1; dx <= 1; ++dx) {
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dz = -1; dz <= 1; ++dz) {
@@ -326,14 +316,13 @@ static size_t doSpatialMerge(std::vector<ItemInfo>& items) {
                     if (it == grid.end()) continue;
 
                     for (size_t j : it->second) {
-                        if (j <= i) continue; // 避免重复
+                        if (j <= i) continue;
                         auto* b = items[j].actor;
                         if (b->mRemoved || b->isDead()) continue;
 
-                        // 调用原版合并
                         if (a->_merge(b)) {
                             mergeCount++;
-                            if (stackA.getCount() >= maxStack) goto nextItem;
+                            if (static_cast<int>(stackA.mCount) >= maxStack) goto nextItem;
                         }
                     }
                 }
@@ -347,9 +336,6 @@ static size_t doSpatialMerge(std::vector<ItemInfo>& items) {
 
 // ============================================================
 // Hook: Level::$tick — 主逻辑
-// 策略：主线程串行 tick 所有 ItemActor（跳过原版合并）
-//       然后用空间哈希做合并
-//       然后并行处理 postNormalTick
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -367,7 +353,6 @@ LL_TYPE_INSTANCE_HOOK(
 
     clearTicked();
 
-    // 收集 ItemActor
     std::vector<ItemInfo> items;
     items.reserve(512);
 
@@ -382,21 +367,20 @@ LL_TYPE_INSTANCE_HOOK(
         items.push_back({itemActor, &bs, pos.x, pos.y, pos.z});
     }
 
-    size_t count     = items.size();
+    size_t count      = items.size();
     size_t mergeCount = 0;
 
     if (count > 0) {
         gInCustomPhase.store(true, std::memory_order_release);
 
-        // 阶段1：主线程串行 tick 所有 ItemActor
-        // _mergeWithNeighbours 被 hook 跳过，所以 tick 很快
+        // 阶段1：主线程串行 tick（_mergeWithNeighbours 被跳过）
         for (auto& e : items) {
             if (e.actor->mRemoved || e.actor->isDead()) continue;
             e.actor->tick(*e.region);
             markTicked(e.actor);
         }
 
-        // 更新位置（tick 后可能移动了）
+        // 更新位置
         for (auto& e : items) {
             if (e.actor->mRemoved) continue;
             auto& pos = e.actor->getPosition();
@@ -405,11 +389,10 @@ LL_TYPE_INSTANCE_HOOK(
             e.z = pos.z;
         }
 
-        // 阶段2：空间哈希合并（主线程，O(n) 替代 O(n²)）
+        // 阶段2：空间哈希合并
         mergeCount = doSpatialMerge(items);
 
         // 阶段3：并行 postNormalTick
-        // postNormalTick 主要做网络同步等轻量操作
         std::vector<std::function<void()>> postTasks;
         size_t batchSize = static_cast<size_t>(gConfig.batchSize);
         for (size_t start = 0; start < count; start += batchSize) {
