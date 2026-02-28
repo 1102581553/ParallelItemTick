@@ -59,6 +59,14 @@ private:
     int                                mActiveWorkers{0};
 };
 
+// 预计算的物理结果，在主线程串行应用
+struct PhysicsResult {
+    float newPosX, newPosY, newPosZ;
+    float newVelX, newVelY, newVelZ;
+    int   newAge;
+    bool  shouldRemove;
+};
+
 extern Config                          gConfig;
 extern std::shared_ptr<ll::io::Logger> gLogger;
 extern bool                            gStatsRunning;
