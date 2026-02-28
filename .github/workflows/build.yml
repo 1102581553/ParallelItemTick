@@ -39,9 +39,12 @@ jobs:
           restore-keys: |
             pkgs-
 
+      - name: Clean output
+        run: if (Test-Path "bin") { Remove-Item -Recurse -Force "bin" }
+        shell: pwsh
+
       - name: Build
         run: |
-          if (Test-Path "bin") { Remove-Item -Recurse -Force "bin" }
           xmake f -a x64 -m release -p windows -y
           xmake -y -j $env:NUMBER_OF_PROCESSORS
         shell: pwsh
