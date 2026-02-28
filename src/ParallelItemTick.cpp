@@ -280,7 +280,7 @@ ParallelItemTickMod& ParallelItemTickMod::getInstance() {
 // 注意：构造函数已移到头文件，这里不再重复定义
 // ParallelItemTickMod::ParallelItemTickMod() 已在头文件内联
 
-ll::mod::NativeMod& ParallelItemTickMod::getSelf() const { return mSelf; }
+// ll::mod::NativeMod& ParallelItemTickMod::getSelf() const { return mSelf; }
 
 bool ParallelItemTickMod::load() {
     std::filesystem::create_directories(getSelf().getConfigDir());
