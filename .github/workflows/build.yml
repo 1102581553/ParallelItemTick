@@ -28,8 +28,8 @@ jobs:
           echo "deps=$depsHash" >> $env:GITHUB_OUTPUT
         shell: pwsh
 
-      - name: Cache xmake packages
-        uses: actions/cache@v4
+      - name: Restore xmake packages
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ env.XMAKE_GLOBALDIR }}
@@ -38,13 +38,23 @@ jobs:
           key: pkgs-${{ steps.hashes.outputs.deps }}
           restore-keys: |
             pkgs-
-          save-always: true
 
       - name: Build
         run: |
+          if (Test-Path "bin") { Remove-Item -Recurse -Force "bin" }
           xmake f -a x64 -m release -p windows -y
           xmake -y -j $env:NUMBER_OF_PROCESSORS
         shell: pwsh
+
+      - name: Save xmake packages
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            ${{ env.XMAKE_GLOBALDIR }}
+            ${{ env.XMAKE_PKG_CACHEDIR }}
+            ${{ env.LOCALAPPDATA }}\.xmake
+          key: pkgs-${{ steps.hashes.outputs.deps }}
 
       - uses: actions/upload-artifact@v4
         with:
