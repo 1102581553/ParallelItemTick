@@ -6,8 +6,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
 #include <ll/api/Config.h>
@@ -38,6 +38,8 @@ public:
 
     void parallelFor(size_t count, std::function<void(size_t)> const& func);
 
+    int getNumWorkers() const { return mNumWorkers; }
+
 private:
     void workerMain();
 
@@ -45,14 +47,16 @@ private:
     std::vector<std::thread> mWorkers;
 
     std::mutex              mMutex;
-    std::condition_variable mCvWork;
-    std::condition_variable mCvDone;
+    std::condition_variable mWorkCv;
+    std::condition_variable mDoneCv;
+
+    bool     mShutdown{false};
+    uint64_t mGeneration{0};
 
     std::function<void(size_t)> const* mWorkFunc{nullptr};
-    std::atomic<size_t>                mNextIndex{0};
     size_t                             mWorkCount{0};
+    std::atomic<size_t>                mNextIndex{0};
     int                                mActiveWorkers{0};
-    bool                               mShutdown{false};
 };
 
 extern Config                          gConfig;
@@ -60,11 +64,7 @@ extern std::shared_ptr<ll::io::Logger> gLogger;
 extern bool                            gStatsRunning;
 extern std::unique_ptr<TickWorkerPool> gWorkerPool;
 
-// 已被并行处理过的 ItemActor 指针集合
-// 只在主线程读写（phase3 串行阶段），无需加锁
-extern std::unordered_set<void*> gProcessedActors;
-
-thread_local extern bool gSuppressMerge;
+extern bool gSkipProcessedItems;
 
 extern std::atomic<uint64_t> gTotalTicks;
 extern std::atomic<uint64_t> gTotalProcessed;
