@@ -1,4 +1,3 @@
-// ParallelItemTick.cpp
 #include "ParallelItemTick.h"
 
 #include <chrono>
@@ -12,6 +11,7 @@
 #include <ll/api/io/LoggerRegistry.h>
 #include <ll/api/memory/Hook.h>
 #include <ll/api/mod/NativeMod.h>
+#include <ll/api/mod/RegisterHelper.h>          // ← 必须加这个
 #include <ll/api/thread/ServerThreadExecutor.h>
 
 #include <mc/world/actor/Actor.h>
@@ -22,9 +22,6 @@
 
 namespace parallel_item_tick {
 
-// ============================================================
-// 全局变量
-// ============================================================
 Config                          gConfig;
 std::shared_ptr<ll::io::Logger> gLogger;
 bool                            gStatsRunning    = false;
@@ -39,9 +36,6 @@ std::atomic<uint64_t> gTotalMerged{0};
 std::atomic<uint64_t> gTotalTimeUs{0};
 std::atomic<uint64_t> gMaxTimeUs{0};
 
-// ============================================================
-// 日志
-// ============================================================
 ll::io::Logger& getLogger() {
     if (!gLogger) {
         gLogger = ll::io::LoggerRegistry::getInstance().getOrCreate("ParallelItemTick");
@@ -49,11 +43,8 @@ ll::io::Logger& getLogger() {
     return *gLogger;
 }
 
-// ============================================================
-// 配置
-// ============================================================
 bool loadConfig() {
-    auto path = ll::mod::NativeMod::current()->getConfigDir() / "config.json";
+    auto path = ParallelItemTickMod::getInstance().getSelf().getConfigDir() / "config.json";
     if (!std::filesystem::exists(path)) {
         getLogger().info("Config not found, creating default config.json");
         return saveConfig();
@@ -71,13 +62,10 @@ bool loadConfig() {
 }
 
 bool saveConfig() {
-    auto path = ll::mod::NativeMod::current()->getConfigDir() / "config.json";
+    auto path = ParallelItemTickMod::getInstance().getSelf().getConfigDir() / "config.json";
     return ll::config::saveConfig(gConfig, path);
 }
 
-// ============================================================
-// 统计任务
-// ============================================================
 void startStatsTask() {
     if (gStatsRunning || !gConfig.stats) return;
     gStatsRunning = true;
@@ -117,9 +105,7 @@ void startStatsTask() {
 
 void stopStatsTask() { gStatsRunning = false; }
 
-// ============================================================
-// TickWorkerPool
-// ============================================================
+// TickWorkerPool 实现
 TickWorkerPool::TickWorkerPool(int numWorkers) : mNumWorkers(numWorkers) {
     for (int i = 0; i < numWorkers; i++) {
         mWorkers.emplace_back([this, i] { workerMain(i); });
@@ -180,9 +166,7 @@ void TickWorkerPool::executeWork() {
     }
 }
 
-// ============================================================
 // Hook 1: ItemActor::_mergeWithNeighbours
-// ============================================================
 LL_TYPE_INSTANCE_HOOK(
     MergeWithNeighboursHook,
     ll::memory::HookPriority::Normal,
@@ -195,10 +179,7 @@ LL_TYPE_INSTANCE_HOOK(
     gTotalMerged.fetch_add(1, std::memory_order_relaxed);
 }
 
-// ============================================================
-// Hook 2: Actor::tick
-// 用 dynamic_cast 判断是否为 ItemActor，避免使用 ActorType 枚举
-// ============================================================
+// Hook 2: Actor::tick — 跳过已并行处理的 ItemActor
 LL_TYPE_INSTANCE_HOOK(
     ActorTickHook,
     ll::memory::HookPriority::Normal,
@@ -213,9 +194,7 @@ LL_TYPE_INSTANCE_HOOK(
     return origin(region);
 }
 
-// ============================================================
-// Hook 3: Level::$tick
-// ============================================================
+// Hook 3: Level::$tick — 主逻辑
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
@@ -237,12 +216,10 @@ LL_TYPE_INSTANCE_HOOK(
     std::vector<ItemEntry> items;
     items.reserve(256);
 
-    // 遍历所有 Actor，过滤出 ItemActor
     auto actorList = getRuntimeActorList();
     for (Actor* actor : actorList) {
         if (!actor) continue;
         if (actor->mRemoved) continue;
-        // 用 dynamic_cast 安全判断类型，不依赖 ActorType 枚举
         auto* itemActor = dynamic_cast<ItemActor*>(actor);
         if (!itemActor) continue;
         BlockSource& bs = actor->getDimensionBlockSource();
@@ -252,7 +229,6 @@ LL_TYPE_INSTANCE_HOOK(
     size_t count = items.size();
 
     if (count < (size_t)gConfig.minParallelCnt) {
-        // 数量不足，走原版逻辑
         origin();
         if (gConfig.debug) {
             getLogger().info("Skipped parallel (count={} < min={})", count, gConfig.minParallelCnt);
@@ -260,20 +236,20 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 阶段 1: 并行 tick（抑制 merge）
+    // 阶段1: 并行 tick
     gWorkerPool->parallelFor(count, [&items](size_t i) {
         gSuppressMerge = true;
         items[i].actor->tick(*items[i].region);
         gSuppressMerge = false;
     });
 
-    // 阶段 2: 串行 merge
+    // 阶段2: 串行 merge
     for (auto& e : items) {
         if (e.actor->mRemoved || e.actor->isDead()) continue;
         e.actor->_mergeWithNeighbours();
     }
 
-    // 阶段 3: 原版 tick，ActorTickHook 跳过已处理的 ItemActor
+    // 阶段3: 原版 tick（跳过已处理的 ItemActor）
     gSkipProcessedItems = true;
     origin();
     gSkipProcessedItems = false;
@@ -295,22 +271,22 @@ LL_TYPE_INSTANCE_HOOK(
     }
 }
 
-// ============================================================
-// 插件主类实现
-// ============================================================
+// 插件主类
 ParallelItemTickMod& ParallelItemTickMod::getInstance() {
     static ParallelItemTickMod instance;
     return instance;
 }
 
-ParallelItemTickMod::ParallelItemTickMod() : mSelf(*ll::mod::NativeMod::current()) {}
+// 注意：构造函数已移到头文件，这里不再重复定义
+// ParallelItemTickMod::ParallelItemTickMod() 已在头文件内联
 
 ll::mod::NativeMod& ParallelItemTickMod::getSelf() const { return mSelf; }
 
 bool ParallelItemTickMod::load() {
-    std::filesystem::create_directories(mSelf.getConfigDir());
+    std::filesystem::create_directories(getSelf().getConfigDir());
     if (!loadConfig()) {
         getLogger().warn("Failed to load config, using defaults");
+        saveConfig();
     }
     getLogger().info(
         "Loaded. enabled={}, debug={}, stats={}, workers={}, minCnt={}",
@@ -358,6 +334,6 @@ bool ParallelItemTickMod::disable() {
 } // namespace parallel_item_tick
 
 // ============================================================
-// 注册插件 - LL_REGISTER_MOD 只接受类名
+// 注册插件 — 与参考插件格式完全一致
 // ============================================================
-LL_REGISTER_MOD(parallel_item_tick::ParallelItemTickMod);
+LL_REGISTER_MOD(parallel_item_tick::ParallelItemTickMod, parallel_item_tick::ParallelItemTickMod::getInstance());
