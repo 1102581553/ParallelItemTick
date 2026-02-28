@@ -4,7 +4,11 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
+#include <latch>
 #include <vector>
+
+#include <ll/api/mod/NativeMod.h>
 
 namespace ll::io {
 class Logger;
@@ -96,7 +100,7 @@ public:
 
     ParallelItemTickMod();
 
-    [[nodiscard]] ll::mod::NativeMod& getSelf() const;
+    [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
 
     bool load();
     bool enable();
