@@ -21,7 +21,6 @@
 #include <mc/world/actor/item/ItemActor.h>
 #include <mc/world/level/BlockSource.h>
 #include <mc/world/level/Level.h>
-#include <mc/world/level/chunk/ChunkSource.h>
 #include <mc/world/level/dimension/Dimension.h>
 
 namespace parallel_item_tick {
@@ -43,33 +42,26 @@ std::atomic<uint64_t> gTotalTimeUs{0};
 std::atomic<uint64_t> gMaxTimeUs{0};
 
 // ============================================================
-// Per-dimension 的 per-thread BlockSource 池
-// key = DimensionType, value = vector<unique_ptr<BlockSource>>
-// 每个 vector 的大小 = workerThreads + 1（+1 给主线程）
+// Per-dimension per-thread BlockSource 池
 // ============================================================
 struct DimBlockSources {
-    Dimension*                                  dimension{nullptr};
-    std::vector<std::unique_ptr<BlockSource>>   sources;
+    std::vector<std::unique_ptr<BlockSource>> sources;
 };
 static std::unordered_map<int, DimBlockSources> gBlockSourcePool;
 
-static void ensureBlockSources(Dimension& dim, int totalSlots) {
-    int dimId = static_cast<int>(dim.getDimensionId());
+static void ensureBlockSources(BlockSource& originalBS, int dimId, int totalSlots) {
     auto& entry = gBlockSourcePool[dimId];
     if (entry.sources.size() >= static_cast<size_t>(totalSlots)) return;
 
-    entry.dimension = &dim;
     entry.sources.reserve(totalSlots);
     while (entry.sources.size() < static_cast<size_t>(totalSlots)) {
-        // 构造一个独立的 BlockSource，绑定到同一个 Dimension 和 ChunkSource
-        // 这样每个线程有自己的 mTempCubeList、mTempEntityList、mLastChunk 缓存
         entry.sources.push_back(std::make_unique<BlockSource>(
-            dim.getLevel(),
-            dim,
-            dim.getChunkSource(),
-            true,   // publicSource
-            false,  // allowUnpopulatedChunks
-            false   // allowClientTickingChanges
+            originalBS.getLevel(),
+            originalBS.getDimension(),
+            originalBS.getChunkSource(),
+            true,
+            false,
+            false
         ));
     }
 }
@@ -188,7 +180,6 @@ void TickWorkerPool::parallelFor(size_t count, std::function<void(size_t)> const
     }
     mWorkCv.notify_all();
 
-    // 主线程也参与
     while (true) {
         size_t idx = mNextIndex.fetch_add(1, std::memory_order_acq_rel);
         if (idx >= count) break;
@@ -232,10 +223,7 @@ void TickWorkerPool::workerMain() {
 }
 
 // ============================================================
-// 线程槽位分配
-// parallelFor 的 lambda 需要知道自己是哪个线程，
-// 以便选择对应的 BlockSource
-// 主线程 = slot 0, worker 线程 = slot 1..N
+// 线程槽位
 // ============================================================
 static thread_local int tSlotId = -1;
 static std::atomic<int> gNextSlot{1};
@@ -268,7 +256,7 @@ struct ChunkKeyHash {
 };
 
 // ============================================================
-// Hook: Actor::tick — 跳过已并行处理的 ItemActor
+// Hook: Actor::tick
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorTickHook,
@@ -285,15 +273,7 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// Hook: Level::$tick — 主逻辑
-//
-// 策略：
-// 1. 收集所有 ItemActor，按 dimension + chunk 分组
-// 2. 为每个 dimension 创建 per-thread BlockSource 实例
-// 3. 棋盘格分 4 phase，每 phase 内并行（不同 chunk 间）
-// 4. 每个线程使用自己的 BlockSource 调用 tick()
-// 5. 串行 merge
-// 6. 原版 tick 跳过已处理的 ItemActor
+// Hook: Level::$tick
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -309,10 +289,9 @@ LL_TYPE_INSTANCE_HOOK(
 
     auto tickStart = std::chrono::steady_clock::now();
 
-    // ── 收集 ──
     struct ItemEntry {
         ItemActor*   actor;
-        Dimension*   dim;
+        BlockSource* originalBS;
         int          dimId;
         int          chunkX;
         int          chunkZ;
@@ -327,14 +306,14 @@ LL_TYPE_INSTANCE_HOOK(
         auto* itemActor = dynamic_cast<ItemActor*>(actor);
         if (!itemActor) continue;
 
+        BlockSource& bs = actor->getDimensionBlockSource();
+        int dimId = static_cast<int>(bs.getDimensionId());
+
         auto const& pos = actor->getPosition();
         int cx = static_cast<int>(std::floor(pos.x)) >> 4;
         int cz = static_cast<int>(std::floor(pos.z)) >> 4;
 
-        Dimension& dim = actor->getDimension();
-        int dimId = static_cast<int>(dim.getDimensionId());
-
-        items.push_back({itemActor, &dim, dimId, cx, cz});
+        items.push_back({itemActor, &bs, dimId, cx, cz});
     }
 
     size_t count = items.size();
@@ -350,16 +329,14 @@ LL_TYPE_INSTANCE_HOOK(
     // ── 准备 per-thread BlockSource ──
     int totalSlots = gWorkerPool->getNumWorkers() + 1;
 
-    // 收集涉及的 dimension
-    std::unordered_map<int, Dimension*> involvedDims;
+    std::unordered_map<int, BlockSource*> involvedDims;
     for (auto& e : items) {
-        involvedDims[e.dimId] = e.dim;
+        involvedDims.emplace(e.dimId, e.originalBS);
     }
-    for (auto& [dimId, dim] : involvedDims) {
-        ensureBlockSources(*dim, totalSlots);
+    for (auto& [dimId, bs] : involvedDims) {
+        ensureBlockSources(*bs, dimId, totalSlots);
     }
 
-    // 主线程 slot = 0
     tSlotId = 0;
     gNextSlot.store(1, std::memory_order_relaxed);
 
@@ -371,21 +348,19 @@ LL_TYPE_INSTANCE_HOOK(
         chunkMap[key].push_back(i);
     }
 
-    // ── 棋盘格分 4 phase ──
-    // phase = ((chunkX & 1) << 1) | (chunkZ & 1)
-    // 同一 phase 内的 chunk 曼哈顿距离 >= 2
+    // ── 棋盘格 4 phase ──
     std::vector<std::vector<size_t>> phases[4];
 
     for (auto& [key, indices] : chunkMap) {
+        // 对负数取模：& 1 在补码下对负数返回 1 或 0（取决于最低位）
+        // 但 -1 & 1 = 1, -2 & 1 = 0，这正好是我们要的奇偶性
         int px = key.x & 1;
         int pz = key.z & 1;
-        if (px < 0) px += 2;
-        if (pz < 0) pz += 2;
         int phase = (px << 1) | pz;
         phases[phase].push_back(std::move(indices));
     }
 
-    // ── 执行 4 个 phase ──
+    // ── 执行 ──
     for (int p = 0; p < 4; p++) {
         auto& chunks = phases[p];
         if (chunks.empty()) continue;
@@ -396,10 +371,8 @@ LL_TYPE_INSTANCE_HOOK(
             for (size_t itemIdx : chunks[chunkIdx]) {
                 auto& e = items[itemIdx];
 
-                // 获取该线程专属的 BlockSource
                 auto& pool = gBlockSourcePool[e.dimId];
-                int safeSlot = slot < static_cast<int>(pool.sources.size())
-                    ? slot : 0;
+                int safeSlot = (slot < static_cast<int>(pool.sources.size())) ? slot : 0;
                 BlockSource& threadBS = *pool.sources[safeSlot];
 
                 try {
@@ -408,12 +381,11 @@ LL_TYPE_INSTANCE_HOOK(
             }
         });
 
-        // 重置 slot 分配，下一个 phase 重新分配
         tSlotId = 0;
         gNextSlot.store(1, std::memory_order_relaxed);
     }
 
-    // ── 串行 merge（用原始 BlockSource）──
+    // ── 串行 merge ──
     size_t mergeCount = 0;
     for (auto& e : items) {
         if (e.actor->mRemoved || e.actor->isDead()) continue;
@@ -423,7 +395,7 @@ LL_TYPE_INSTANCE_HOOK(
         } catch (...) {}
     }
 
-    // ── 原版 tick，跳过已处理的 ItemActor ──
+    // ── 原版 tick ──
     gSkipProcessedItems = true;
     origin();
     gSkipProcessedItems = false;
@@ -447,7 +419,7 @@ LL_TYPE_INSTANCE_HOOK(
 
     if (gConfig.debug) {
         getLogger().info(
-            "Tick: {} items, {} chunks, 4 phases, {:.2f}ms",
+            "Tick: {} items, {} chunks, {:.2f}ms",
             count, chunkMap.size(), elapsedUs / 1000.0
         );
     }
