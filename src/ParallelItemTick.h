@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 
 #include <ll/api/Config.h>
@@ -18,9 +19,12 @@ struct Config {
     bool enabled    = true;
     bool debug      = false;
     bool stats      = true;
-    int  numThreads = 0; // 0 = auto
+    int  numThreads = 0;
     int  batchSize  = 32;
 };
+
+// 全局并行锁：并行阶段持有共享锁，实体销毁持有独占锁
+extern std::shared_mutex gParallelMutex;
 
 extern Config                          gConfig;
 extern std::shared_ptr<ll::io::Logger> gLogger;
