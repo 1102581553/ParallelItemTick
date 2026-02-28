@@ -295,41 +295,27 @@ struct ItemInfo {
     float      x, y, z;
 };
 
+struct ItemMergeInfo {
+    bool  valid;
+    short itemId;
+    short auxValue;
+    uchar count;
+    uchar maxStack;
+};
+
 // 并行查找合并候选对（纯只读，不调用任何 BDS API）
-static std::vector<MergePair> findMergeCandidatesParallel(std::vector<ItemInfo>& items) {
+static std::vector<MergePair> findMergeCandidatesParallel(
+    std::vector<ItemInfo>&      items,
+    std::vector<ItemMergeInfo>& mergeInfo
+) {
     if (items.empty()) return {};
 
-    // 构建空间哈希（主线程，快速）
+    // 构建空间哈希
     std::unordered_map<CellKey, std::vector<size_t>, CellKeyHash> grid;
     grid.reserve(items.size());
 
-    // 预计算每个 item 的可合并信息
-    struct ItemMergeInfo {
-        bool  valid;
-        short itemId;
-        short auxValue;
-        uchar count;
-        uchar maxStack;
-    };
-    std::vector<ItemMergeInfo> mergeInfo(items.size());
-
     for (size_t i = 0; i < items.size(); ++i) {
-        auto* a = items[i].actor;
-        if (a->mRemoved || a->isDead()) {
-            mergeInfo[i].valid = false;
-            continue;
-        }
-        auto& stack = a->item();
-        if (stack.isNull()) {
-            mergeInfo[i].valid = false;
-            continue;
-        }
-        mergeInfo[i].valid    = true;
-        mergeInfo[i].itemId   = stack.getId();
-        mergeInfo[i].auxValue = stack.getAuxValue();
-        mergeInfo[i].count    = stack.mCount;
-        mergeInfo[i].maxStack = stack.getMaxStackSize();
-
+        if (!mergeInfo[i].valid) continue;
         auto key = posToCell(items[i].x, items[i].y, items[i].z);
         grid[key].push_back(i);
     }
@@ -341,8 +327,10 @@ static std::vector<MergePair> findMergeCandidatesParallel(std::vector<ItemInfo>&
         allCells.push_back(key);
     }
 
+    if (allCells.empty()) return {};
+
     // 并行查找候选对
-    std::mutex pairsMutex;
+    std::mutex             pairsMutex;
     std::vector<MergePair> allPairs;
 
     std::vector<std::function<void()>> tasks;
@@ -363,12 +351,11 @@ static std::vector<MergePair> findMergeCandidatesParallel(std::vector<ItemInfo>&
                     if (!infoA.valid) continue;
                     if (infoA.count >= infoA.maxStack) continue;
 
-                    // 只搜索同 cell 和 +方向邻居（避免重复）
                     for (int dx = 0; dx <= 1; ++dx) {
                         for (int dy = -1; dy <= 1; ++dy) {
                             for (int dz = (dx == 0 ? 0 : -1); dz <= 1; ++dz) {
                                 CellKey nk{cellKey.x + dx, cellKey.y + dy, cellKey.z + dz};
-                                auto nit = grid.find(nk);
+                                auto    nit = grid.find(nk);
                                 if (nit == grid.end()) continue;
 
                                 for (size_t j : nit->second) {
@@ -376,11 +363,9 @@ static std::vector<MergePair> findMergeCandidatesParallel(std::vector<ItemInfo>&
                                     auto& infoB = mergeInfo[j];
                                     if (!infoB.valid) continue;
 
-                                    // 快速检查：同物品类型
                                     if (infoA.itemId != infoB.itemId) continue;
                                     if (infoA.auxValue != infoB.auxValue) continue;
 
-                                    // 距离检查
                                     float ddx = items[idx].x - items[j].x;
                                     float ddy = items[idx].y - items[j].y;
                                     float ddz = items[idx].z - items[j].z;
@@ -445,6 +430,7 @@ LL_TYPE_INSTANCE_HOOK(
 
     size_t count      = items.size();
     size_t mergeCount = 0;
+    size_t candidates = 0;
 
     if (count > 0) {
         gInCustomPhase.store(true, std::memory_order_release);
@@ -457,19 +443,36 @@ LL_TYPE_INSTANCE_HOOK(
             markTicked(e.uid);
         }
 
-        // 更新位置
-        for (auto& e : items) {
-            if (e.actor->mRemoved) continue;
-            auto& pos = e.actor->getPosition();
-            e.x = pos.x;
-            e.y = pos.y;
-            e.z = pos.z;
+        // 更新位置 + 预计算合并信息（主线程读取 BDS 数据）
+        std::vector<ItemMergeInfo> mergeInfo(count);
+        for (size_t i = 0; i < count; ++i) {
+            auto* a = items[i].actor;
+            if (a->mRemoved || a->isDead()) {
+                mergeInfo[i].valid = false;
+                continue;
+            }
+            auto& pos = a->getPosition();
+            items[i].x = pos.x;
+            items[i].y = pos.y;
+            items[i].z = pos.z;
+
+            auto& stack = a->item();
+            if (stack.isNull()) {
+                mergeInfo[i].valid = false;
+                continue;
+            }
+            mergeInfo[i].valid    = true;
+            mergeInfo[i].itemId   = stack.getId();
+            mergeInfo[i].auxValue = stack.getAuxValue();
+            mergeInfo[i].count    = stack.mCount;
+            mergeInfo[i].maxStack = stack.getMaxStackSize();
         }
 
-        // 阶段2：并行查找合并候选对（纯只读计算，不调用 BDS API）
-        auto pairs = findMergeCandidatesParallel(items);
+        // 阶段2：并行查找合并候选对（纯只读计算）
+        auto pairs = findMergeCandidatesParallel(items, mergeInfo);
+        candidates = pairs.size();
 
-        // 阶段3：主线程串行执行合并（调用 BDS API）
+        // 阶段3：主线程串行执行合并
         for (auto& p : pairs) {
             auto* a = items[p.a].actor;
             auto* b = items[p.b].actor;
@@ -506,7 +509,7 @@ LL_TYPE_INSTANCE_HOOK(
     if (gConfig.debug) {
         getLogger().info(
             "Tick: {} items, {} merges, {} candidates, {:.2f}ms",
-            count, mergeCount, pairs.size(), elapsedUs / 1000.0
+            count, mergeCount, candidates, elapsedUs / 1000.0
         );
     }
 }
