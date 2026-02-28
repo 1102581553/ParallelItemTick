@@ -142,32 +142,31 @@ std::atomic<uint64_t> gTotalMerges{0};
 std::atomic<uint64_t> gTotalTimeUs{0};
 std::atomic<uint64_t> gMaxTimeUs{0};
 
-static std::atomic<bool> gInCustomPhase{false};
-static uint64_t          gFrameCounter = 0;
+static uint64_t gFrameCounter = 0;
 
-// 无锁已处理集合：用指针地址，避免调用 getOrCreateUniqueID
-static std::vector<const Actor*> gTickedActorsSorted;
-static bool                      gTickedActorsDirty = false;
+// 已处理集合：排序指针数组，只在主线程读写
+static std::vector<const Actor*> gTickedActors;
+static bool                      gTickedSorted = false;
 
 static void clearTicked() {
-    gTickedActorsSorted.clear();
-    gTickedActorsDirty = false;
+    gTickedActors.clear();
+    gTickedSorted = false;
 }
 
 static void markTicked(const Actor* actor) {
-    gTickedActorsSorted.push_back(actor);
-    gTickedActorsDirty = true;
+    gTickedActors.push_back(actor);
+    gTickedSorted = false;
 }
 
 static void finalizeTicked() {
-    if (gTickedActorsDirty) {
-        std::sort(gTickedActorsSorted.begin(), gTickedActorsSorted.end());
-        gTickedActorsDirty = false;
+    if (!gTickedSorted && !gTickedActors.empty()) {
+        std::sort(gTickedActors.begin(), gTickedActors.end());
+        gTickedSorted = true;
     }
 }
 
 static bool wasTicked(const Actor* actor) {
-    return std::binary_search(gTickedActorsSorted.begin(), gTickedActorsSorted.end(), actor);
+    return std::binary_search(gTickedActors.begin(), gTickedActors.end(), actor);
 }
 
 ll::io::Logger& getLogger() {
@@ -251,41 +250,38 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// Hook: Actor::$normalTick — 跳过已处理的 ItemActor
+// Hook: Actor::tick — 跳过已处理的 ItemActor
+// 用非虚函数 Actor::tick(BlockSource&) 而不是虚函数 normalTick
+// 这样不会和 normalTick 内部产生重入问题
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
-    ActorNormalTickHook,
+    ActorTickHook,
     ll::memory::HookPriority::Normal,
     Actor,
-    &Actor::$normalTick,
-    void
+    &Actor::tick,
+    bool,
+    BlockSource& region
 ) {
     if (!gConfig.enabled) {
-        origin();
-        return;
+        return origin(region);
     }
 
+    // 只拦截 ItemActor
     if (this->getEntityTypeId() != ActorType::ItemEntity) {
-        origin();
-        return;
+        return origin(region);
     }
 
-    if (gInCustomPhase.load(std::memory_order_acquire)) {
-        origin();
-        return;
-    }
-
+    // 已移除的让原版处理
     if (this->mRemoved) {
-        origin();
-        return;
+        return origin(region);
     }
 
-    // 直接用指针检查，不调用 getOrCreateUniqueID
+    // 检查是否已处理
     if (wasTicked(this)) {
-        return;
+        return true; // 跳过，返回 true 表示 tick 成功
     }
 
-    origin();
+    return origin(region);
 }
 
 // ============================================================
@@ -444,8 +440,6 @@ LL_TYPE_INSTANCE_HOOK(
     size_t candidates = 0;
 
     if (count > 0) {
-        gInCustomPhase.store(true, std::memory_order_release);
-
         // 阶段1：主线程串行 tick（_mergeWithNeighbours 被跳过）
         for (auto& e : items) {
             if (e.actor->mRemoved || e.actor->isDead()) continue;
@@ -454,7 +448,7 @@ LL_TYPE_INSTANCE_HOOK(
             markTicked(e.actor);
         }
 
-        // 排序已处理指针列表
+        // 排序已处理指针列表（为 origin() 阶段的 ActorTickHook 准备）
         finalizeTicked();
 
         // 阶段2：每 mergeInterval 帧做一次合并
@@ -515,11 +509,13 @@ LL_TYPE_INSTANCE_HOOK(
                 }
             }
         }
-
-        gInCustomPhase.store(false, std::memory_order_release);
     }
 
+    // 原版 tick，已处理的 ItemActor 通过 ActorTickHook 跳过
     origin();
+
+    // 清除（下一帧重新收集）
+    clearTicked();
 
     auto elapsedUs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -580,7 +576,7 @@ bool ParallelItemTickMod::enable() {
     gThreadPool = std::make_unique<ThreadPool>(static_cast<size_t>(threads));
 
     LevelTickHook::hook();
-    ActorNormalTickHook::hook();
+    ActorTickHook::hook();
     MergeWithNeighboursHook::hook();
 
     if (gConfig.stats) startStatsTask();
@@ -595,7 +591,7 @@ bool ParallelItemTickMod::enable() {
 bool ParallelItemTickMod::disable() {
     stopStatsTask();
     MergeWithNeighboursHook::unhook();
-    ActorNormalTickHook::unhook();
+    ActorTickHook::unhook();
     LevelTickHook::unhook();
     gThreadPool.reset();
     clearTicked();
