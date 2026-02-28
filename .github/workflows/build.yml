@@ -21,24 +21,15 @@ jobs:
         with:
           xmake-version: latest
 
-      # ── 计算缓存 key ──
-      - name: Hash sources
+      - name: Hash deps
         id: hashes
         run: |
-          $srcHash = (Get-FileHash -Algorithm SHA256 -InputStream (
-            [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes(
-              (Get-ChildItem -Recurse -Include *.cpp,*.h,*.hpp -Path src | Get-Content -Raw) + (Get-Content xmake.lua -Raw)
-            ))
-          )).Hash.Substring(0, 16)
           $depsHash = (Get-FileHash -Algorithm SHA256 -Path xmake.lua).Hash.Substring(0, 16)
-          echo "src=$srcHash" >> $env:GITHUB_OUTPUT
           echo "deps=$depsHash" >> $env:GITHUB_OUTPUT
         shell: pwsh
 
-      # ── 缓存 xmake 包（最大瓶颈）──
       - name: Cache xmake packages
         uses: actions/cache@v4
-        id: cache-packages
         with:
           path: |
             ${{ env.XMAKE_GLOBALDIR }}
@@ -49,37 +40,12 @@ jobs:
             pkgs-
           save-always: true
 
-      # ── 缓存构建中间产物（.obj）──
-      - name: Cache build
-        uses: actions/cache@v4
-        id: cache-build
-        with:
-          path: build
-          key: build-${{ steps.hashes.outputs.src }}
-          restore-keys: |
-            build-
-          save-always: true
-
-      - name: Cache status
-        run: |
-          echo "Packages cache: ${{ steps.cache-packages.outputs.cache-hit }}"
-          echo "Build cache: ${{ steps.cache-build.outputs.cache-hit }}"
-
-      # ── Configure（仅在需要时）──
-      - name: Configure
-        if: steps.cache-build.outputs.cache-hit != 'true'
-        run: xmake f -a x64 -m release -p windows -y
-
-      # ── 构建 ──
       - name: Build
         run: |
-          if (-not (Test-Path "build\.gens")) {
-            xmake f -a x64 -m release -p windows -y
-          }
+          xmake f -a x64 -m release -p windows -y
           xmake -y -j $env:NUMBER_OF_PROCESSORS
         shell: pwsh
 
-      # ── 产物（用 run_number 区分，不影响缓存）──
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.repository.name }}-windows-x64-${{ github.run_number }}
