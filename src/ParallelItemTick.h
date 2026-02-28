@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <memory>
-#include <shared_mutex>
 #include <string>
 
 #include <ll/api/Config.h>
@@ -20,11 +19,8 @@ struct Config {
     bool debug      = false;
     bool stats      = true;
     int  numThreads = 0;
-    int  batchSize  = 32;
+    int  batchSize  = 64;
 };
-
-// 全局并行锁：并行阶段持有共享锁，实体销毁持有独占锁
-extern std::shared_mutex gParallelMutex;
 
 extern Config                          gConfig;
 extern std::shared_ptr<ll::io::Logger> gLogger;
@@ -32,6 +28,7 @@ extern bool                            gStatsRunning;
 
 extern std::atomic<uint64_t> gTotalTicks;
 extern std::atomic<uint64_t> gTotalProcessed;
+extern std::atomic<uint64_t> gTotalMerges;
 extern std::atomic<uint64_t> gTotalTimeUs;
 extern std::atomic<uint64_t> gMaxTimeUs;
 
