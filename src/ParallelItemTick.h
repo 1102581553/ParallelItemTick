@@ -26,6 +26,7 @@ struct Config {
     bool stats          = true;
     int  minParallelCnt = 16;
     int  workerThreads  = 0;
+    int  batchSize      = 64;
 };
 
 class TickWorkerPool {
@@ -59,20 +60,10 @@ private:
     int                                mActiveWorkers{0};
 };
 
-// 预计算的物理结果，在主线程串行应用
-struct PhysicsResult {
-    float newPosX, newPosY, newPosZ;
-    float newVelX, newVelY, newVelZ;
-    int   newAge;
-    bool  shouldRemove;
-};
-
 extern Config                          gConfig;
 extern std::shared_ptr<ll::io::Logger> gLogger;
 extern bool                            gStatsRunning;
 extern std::unique_ptr<TickWorkerPool> gWorkerPool;
-
-extern bool gSkipProcessedItems;
 
 extern std::atomic<uint64_t> gTotalTicks;
 extern std::atomic<uint64_t> gTotalProcessed;
