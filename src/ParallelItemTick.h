@@ -3,7 +3,6 @@
 #include <atomic>
 #include <memory>
 #include <string>
-#include <vector>
 
 #include <ll/api/Config.h>
 #include <ll/api/mod/NativeMod.h>
@@ -19,7 +18,7 @@ struct Config {
     bool enabled    = true;
     bool debug      = false;
     bool stats      = true;
-    int  numThreads = 0; // 0 = auto (hardware_concurrency - 1, min 2)
+    int  numThreads = 0; // 0 = auto
     int  batchSize  = 32;
 };
 
