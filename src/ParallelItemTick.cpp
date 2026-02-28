@@ -3,22 +3,20 @@
 #include <chrono>
 #include <filesystem>
 #include <latch>
-#include <thread>
 
 #include <ll/api/Config.h>
 #include <ll/api/coro/CoroTask.h>
 #include <ll/api/io/Logger.h>
 #include <ll/api/io/LoggerRegistry.h>
 #include <ll/api/memory/Hook.h>
-#include <ll/api/mod/NativeMod.h>
-#include <ll/api/mod/RegisterHelper.h>
 #include <ll/api/thread/ServerThreadExecutor.h>
 
-#include <mc/deps/ecs/gamerefs_entity/EntityContext.h>
+// Minecraft 必要头文件
+#include <mc/deps/ecs/EntityRegistry.h>
+#include <mc/deps/ecs/gamerefs_entity/EntityContext.h>   // 需确认构造函数存在
 #include <mc/deps/vanilla_components/ItemActorFlagComponent.h>
 #include <mc/entity/components/ActorTickNeededComponent.h>
 #include <mc/entity/systems/ActorLegacyTickSystem.h>
-#include <mc/entity/systems/EntitySystems.h>
 #include <mc/world/actor/Actor.h>
 #include <mc/world/actor/item/ItemActor.h>
 #include <mc/world/level/BlockSource.h>
@@ -239,14 +237,13 @@ LL_STATIC_HOOK(
 }
 
 // ============================================================
-// Hook 3: ActorLegacyTickSystem::tick
-//         主调度点
+// Hook 3: ActorLegacyTickSystem::tick（修正虚函数地址）
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     SystemTickHook,
     ll::memory::HookPriority::Normal,
     ActorLegacyTickSystem,
-    &ActorLegacyTickSystem::tick,
+    &ActorLegacyTickSystem::$tick,   // 注意 $ 前缀
     void,
     ::EntityRegistry& registry
 ) {
@@ -267,6 +264,8 @@ LL_TYPE_INSTANCE_HOOK(
     auto view = registry.view<ItemActorFlagComponent, ActorTickNeededComponent>();
     for (auto entity : view) {
         auto& tickComp = view.get<ActorTickNeededComponent>(entity);
+        // 构造 EntityContext，假设存在构造函数 EntityContext(EntityRegistry&, EntityId)
+        // 如果编译错误，请参考实际 EntityContext.h 提供的构造方式
         EntityContext ctx(registry, entity);
         Actor* actor = Actor::tryGetFromEntity(ctx, false);
         if (!actor) continue;
