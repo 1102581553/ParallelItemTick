@@ -36,5 +36,5 @@ target("ParallelItemTick")
 
     add_syslinks("shlwapi", "advapi32")
 
-    set_targetdir("bin")
+    set_targetdir("build")
     set_runtimes("MD")
