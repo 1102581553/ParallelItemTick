@@ -147,12 +147,10 @@ std::atomic<uint64_t> gTotalMerges{0};
 std::atomic<uint64_t> gTotalTimeUs{0};
 std::atomic<uint64_t> gMaxTimeUs{0};
 
-static std::atomic<bool> gInParallelPhase{false};
+static std::atomic<bool> gInCustomPhase{false};
 
-// 使用 ActorUniqueID 而不是指针来跟踪已处理的实体
-// 这样即使实体被销毁，ID 检查也不会访问悬空指针
-static std::mutex                              gTickedMutex;
-static std::unordered_set<int64_t>             gTickedIds;
+static std::mutex                  gTickedMutex;
+static std::unordered_set<int64_t> gTickedIds;
 
 static void markTicked(int64_t id) {
     std::lock_guard lock(gTickedMutex);
@@ -167,26 +165,6 @@ static bool wasTicked(int64_t id) {
 static void clearTicked() {
     std::lock_guard lock(gTickedMutex);
     gTickedIds.clear();
-}
-
-// 延迟操作
-static std::mutex                         gDeferredMutex;
-static std::vector<std::function<void()>> gDeferredActions;
-
-static void deferAction(std::function<void()> action) {
-    std::lock_guard lock(gDeferredMutex);
-    gDeferredActions.push_back(std::move(action));
-}
-
-static void executeDeferredActions() {
-    std::vector<std::function<void()>> actions;
-    {
-        std::lock_guard lock(gDeferredMutex);
-        actions.swap(gDeferredActions);
-    }
-    for (auto& a : actions) {
-        a();
-    }
 }
 
 ll::io::Logger& getLogger() {
@@ -254,7 +232,7 @@ void startStatsTask() {
 void stopStatsTask() { gStatsRunning = false; }
 
 // ============================================================
-// Hook: ItemActor::_mergeWithNeighbours — 跳过原版合并
+// Hook: ItemActor::_mergeWithNeighbours — 跳过原版 O(n²) 合并
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     MergeWithNeighboursHook,
@@ -289,15 +267,11 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 并行阶段放行
-    if (gInParallelPhase.load(std::memory_order_acquire)) {
+    if (gInCustomPhase.load(std::memory_order_acquire)) {
         origin();
         return;
     }
 
-    // 原版阶段：用 UniqueID 检查，不访问可能已销毁的对象内部
-    // getOrCreateUniqueID 在 Actor 基类中，只读取 mLegacyUniqueID 成员
-    // 如果实体已被 remove 但内存还在（同一帧内），这个读取是安全的
     if (this->mRemoved) {
         origin();
         return;
@@ -312,128 +286,18 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// Hook: Actor::$remove — 并行阶段延迟
-// ============================================================
-LL_TYPE_INSTANCE_HOOK(
-    ActorRemoveHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::$remove,
-    void
-) {
-    if (gInParallelPhase.load(std::memory_order_acquire)) {
-        this->mRemoved = true;
-        Actor* self = this;
-        deferAction([self] { self->$remove(); });
-        return;
-    }
-    origin();
-}
-
-// ============================================================
-// Hook: Actor::$kill — 并行阶段延迟
-// ============================================================
-LL_TYPE_INSTANCE_HOOK(
-    ActorKillHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::$kill,
-    void
-) {
-    if (gInParallelPhase.load(std::memory_order_acquire)) {
-        this->mRemoved = true;
-        Actor* self = this;
-        deferAction([self] { self->$kill(); });
-        return;
-    }
-    origin();
-}
-
-// ============================================================
-// Hook: Actor::$die — 并行阶段延迟
-// ============================================================
-LL_TYPE_INSTANCE_HOOK(
-    ActorDieHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::$die,
-    void,
-    ::ActorDamageSource const& source
-) {
-    if (gInParallelPhase.load(std::memory_order_acquire)) {
-        this->mRemoved = true;
-        Actor* self = this;
-        deferAction([self] { self->$kill(); });
-        return;
-    }
-    origin(source);
-}
-
-// ============================================================
-// 空间哈希合并
+// 并行空间哈希合并（棋盘格分区）
 // ============================================================
 struct ItemInfo {
-    ItemActor*   actor;
-    BlockSource* region;
-    int64_t      uid;
-    float        x, y, z;
+    ItemActor* actor;
+    int64_t    uid;
+    float      x, y, z;
 };
 
-static size_t doSpatialMerge(std::vector<ItemInfo>& items) {
-    std::unordered_map<CellKey, std::vector<size_t>, CellKeyHash> grid;
-    grid.reserve(items.size());
-
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (items[i].actor->mRemoved) continue;
-        auto key = posToCell(items[i].x, items[i].y, items[i].z);
-        grid[key].push_back(i);
-    }
-
-    size_t mergeCount = 0;
-
-    for (size_t i = 0; i < items.size(); ++i) {
-        auto* a = items[i].actor;
-        if (a->mRemoved || a->isDead()) continue;
-
-        auto& stackA = a->item();
-        if (stackA.isNull()) continue;
-
-        int maxStack = static_cast<int>(stackA.getMaxStackSize());
-        if (static_cast<int>(stackA.mCount) >= maxStack) continue;
-
-        auto cellA = posToCell(items[i].x, items[i].y, items[i].z);
-
-        for (int dx = -1; dx <= 1; ++dx) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dz = -1; dz <= 1; ++dz) {
-                    CellKey neighborKey{cellA.x + dx, cellA.y + dy, cellA.z + dz};
-                    auto it = grid.find(neighborKey);
-                    if (it == grid.end()) continue;
-
-                    for (size_t j : it->second) {
-                        if (j <= i) continue;
-                        auto* b = items[j].actor;
-                        if (b->mRemoved || b->isDead()) continue;
-
-                        if (a->_merge(b)) {
-                            mergeCount++;
-                            if (static_cast<int>(stackA.mCount) >= maxStack) goto nextItem;
-                        }
-                    }
-                }
-            }
-        }
-        nextItem:;
-    }
-
-    return mergeCount;
-}
-
-// ============================================================
-// 并行合并：棋盘格分区
-// ============================================================
 static size_t doParallelSpatialMerge(std::vector<ItemInfo>& items) {
-    // 构建全局空间哈希
+    if (items.empty()) return 0;
+
+    // 构建空间哈希
     std::unordered_map<CellKey, std::vector<size_t>, CellKeyHash> grid;
     grid.reserve(items.size());
 
@@ -443,7 +307,7 @@ static size_t doParallelSpatialMerge(std::vector<ItemInfo>& items) {
         grid[key].push_back(i);
     }
 
-    // 按 cell 颜色分组
+    // 按颜色分组
     std::vector<CellKey> color0Cells;
     std::vector<CellKey> color1Cells;
     for (auto& [key, _] : grid) {
@@ -455,12 +319,15 @@ static size_t doParallelSpatialMerge(std::vector<ItemInfo>& items) {
 
     std::atomic<size_t> totalMerges{0};
 
+    // 处理一组同色 cell 的合并
     auto processCells = [&](std::vector<CellKey>& cells) {
         if (cells.empty()) return;
 
         std::vector<std::function<void()>> tasks;
-        // 每个任务处理一批 cell
-        size_t cellsPerTask = std::max<size_t>(1, cells.size() / (gThreadPool->threadCount() * 2));
+        size_t cellsPerTask = std::max<size_t>(
+            1, cells.size() / (gThreadPool->threadCount() * 2)
+        );
+
         for (size_t start = 0; start < cells.size(); start += cellsPerTask) {
             size_t end = std::min(start + cellsPerTask, cells.size());
             tasks.push_back([&, start, end] {
@@ -480,7 +347,6 @@ static size_t doParallelSpatialMerge(std::vector<ItemInfo>& items) {
                         int maxStack = static_cast<int>(stackA.getMaxStackSize());
                         if (static_cast<int>(stackA.mCount) >= maxStack) continue;
 
-                        // 搜索同 cell 和相邻 cell（同色 cell 的邻居都是异色的，不会并行修改）
                         for (int dx = -1; dx <= 1; ++dx) {
                             for (int dy = -1; dy <= 1; ++dy) {
                                 for (int dz = -1; dz <= 1; ++dz) {
@@ -516,7 +382,6 @@ static size_t doParallelSpatialMerge(std::vector<ItemInfo>& items) {
         }
     };
 
-    // 两轮：先处理颜色0，再处理颜色1
     processCells(color0Cells);
     processCells(color1Cells);
 
@@ -525,6 +390,7 @@ static size_t doParallelSpatialMerge(std::vector<ItemInfo>& items) {
 
 // ============================================================
 // Hook: Level::$tick — 主逻辑
+// 主线程串行 tick（跳过合并所以很快）+ 并行空间哈希合并
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -542,6 +408,7 @@ LL_TYPE_INSTANCE_HOOK(
 
     clearTicked();
 
+    // 收集 ItemActor
     std::vector<ItemInfo> items;
     items.reserve(512);
 
@@ -550,80 +417,27 @@ LL_TYPE_INSTANCE_HOOK(
         if (!actor || actor->mRemoved) continue;
         if (actor->getEntityTypeId() != ActorType::ItemEntity) continue;
 
-        auto*        itemActor = static_cast<ItemActor*>(actor);
-        BlockSource& bs        = actor->getDimensionBlockSource();
-        auto&        pos       = actor->getPosition();
-        auto         uid       = actor->getOrCreateUniqueID();
-        items.push_back({itemActor, &bs, uid.rawID, pos.x, pos.y, pos.z});
+        auto* itemActor = static_cast<ItemActor*>(actor);
+        auto  uid       = actor->getOrCreateUniqueID();
+        auto& pos       = actor->getPosition();
+        items.push_back({itemActor, uid.rawID, pos.x, pos.y, pos.z});
     }
 
     size_t count      = items.size();
     size_t mergeCount = 0;
 
     if (count > 0) {
-        gInParallelPhase.store(true, std::memory_order_release);
+        gInCustomPhase.store(true, std::memory_order_release);
 
-        // 阶段1：并行 tick（棋盘格分区，按 chunk）
-        // 按 chunk 分组
-        struct ChunkKey {
-            int x, z;
-            bool operator==(const ChunkKey& o) const { return x == o.x && z == o.z; }
-        };
-        struct ChunkKeyHash {
-            size_t operator()(const ChunkKey& k) const {
-                return std::hash<int64_t>()(static_cast<int64_t>(k.x) << 32 |
-                                            static_cast<uint32_t>(k.z));
-            }
-        };
-
-        std::unordered_map<ChunkKey, std::vector<size_t>, ChunkKeyHash> chunkMap;
-        for (size_t i = 0; i < count; ++i) {
-            int cx = static_cast<int>(std::floor(items[i].x)) >> 4;
-            int cz = static_cast<int>(std::floor(items[i].z)) >> 4;
-            chunkMap[{cx, cz}].push_back(i);
+        // 阶段1：主线程串行 tick（_mergeWithNeighbours 被跳过，所以很快）
+        for (auto& e : items) {
+            if (e.actor->mRemoved || e.actor->isDead()) continue;
+            BlockSource& bs = e.actor->getDimensionBlockSource();
+            e.actor->tick(bs);
+            markTicked(e.uid);
         }
 
-        // 棋盘格分两色
-        std::vector<std::vector<size_t>*> color0;
-        std::vector<std::vector<size_t>*> color1;
-        for (auto& [key, indices] : chunkMap) {
-            int color = ((key.x % 2 + 2) % 2 + (key.z % 2 + 2) % 2) % 2;
-            if (color == 0)
-                color0.push_back(&indices);
-            else
-                color1.push_back(&indices);
-        }
-
-        auto tickChunks = [&](std::vector<std::vector<size_t>*>& chunks) {
-            if (chunks.empty()) return;
-
-            std::vector<std::function<void()>> tasks;
-            tasks.reserve(chunks.size());
-
-            for (auto* chunkIndices : chunks) {
-                tasks.push_back([&items, chunkIndices] {
-                    for (size_t idx : *chunkIndices) {
-                        auto& e = items[idx];
-                        if (e.actor->mRemoved || e.actor->isDead()) continue;
-                        e.actor->tick(*e.region);
-                        markTicked(e.uid);
-                    }
-                });
-            }
-
-            if (tasks.size() > 1) {
-                gThreadPool->submitAndWait(tasks);
-            } else {
-                tasks[0]();
-            }
-        };
-
-        tickChunks(color0);
-        executeDeferredActions();
-        tickChunks(color1);
-        executeDeferredActions();
-
-        // 更新位置
+        // 更新位置（tick 后可能移动了）
         for (auto& e : items) {
             if (e.actor->mRemoved) continue;
             auto& pos = e.actor->getPosition();
@@ -632,11 +446,10 @@ LL_TYPE_INSTANCE_HOOK(
             e.z = pos.z;
         }
 
-        // 阶段2：并行空间哈希合并
+        // 阶段2：并行空间哈希合并（棋盘格分区，线程安全）
         mergeCount = doParallelSpatialMerge(items);
 
-        gInParallelPhase.store(false, std::memory_order_release);
-        executeDeferredActions();
+        gInCustomPhase.store(false, std::memory_order_release);
     }
 
     // 原版 tick，已处理的 ItemActor 通过 UniqueID 跳过
@@ -704,14 +517,11 @@ bool ParallelItemTickMod::enable() {
     LevelTickHook::hook();
     ActorNormalTickHook::hook();
     MergeWithNeighboursHook::hook();
-    ActorRemoveHook::hook();
-    ActorKillHook::hook();
-    ActorDieHook::hook();
 
     if (gConfig.stats) startStatsTask();
 
     getLogger().info(
-        "Enabled — {} threads, parallel tick + parallel merge",
+        "Enabled — {} threads, main-thread tick (no merge) + parallel spatial merge",
         threads
     );
     return true;
@@ -719,9 +529,6 @@ bool ParallelItemTickMod::enable() {
 
 bool ParallelItemTickMod::disable() {
     stopStatsTask();
-    ActorDieHook::unhook();
-    ActorKillHook::unhook();
-    ActorRemoveHook::unhook();
     MergeWithNeighboursHook::unhook();
     ActorNormalTickHook::unhook();
     LevelTickHook::unhook();
