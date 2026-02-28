@@ -1,4 +1,3 @@
-// ParallelItemTick.cpp test
 #include "ParallelItemTick.h"
 
 #include <chrono>
@@ -15,6 +14,7 @@
 #include <ll/api/thread/ServerThreadExecutor.h>
 
 #include <mc/world/actor/Actor.h>
+#include <mc/world/actor/ActorType.h>
 #include <mc/world/actor/item/ItemActor.h>
 #include <mc/world/level/BlockSource.h>
 #include <mc/world/level/Level.h>
@@ -90,12 +90,6 @@ void startStatsTask() {
 
 void stopStatsTask() { gStatsRunning = false; }
 
-// ============================================================
-// 唯一的 Hook: Level::$tick
-//
-// 不 hook Actor::tick，避免与其他插件冲突。
-// 在 origin() 之前预处理 ItemActor，之后不需要跳过。
-// ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
@@ -110,7 +104,6 @@ LL_TYPE_INSTANCE_HOOK(
 
     auto tickStart = std::chrono::steady_clock::now();
 
-    // 收集 ItemActor
     struct ItemEntry {
         ItemActor*   actor;
         BlockSource* region;
@@ -122,40 +115,18 @@ LL_TYPE_INSTANCE_HOOK(
     auto actorList = getRuntimeActorList();
     for (Actor* actor : actorList) {
         if (!actor || actor->mRemoved) continue;
-        auto* itemActor = dynamic_cast<ItemActor*>(actor);
-        if (!itemActor) continue;
-        BlockSource& bs = actor->getDimensionBlockSource();
+
+        // 用类型 ID 检查代替 dynamic_cast，避免 vtable 不完整时崩溃
+        if (actor->getEntityTypeId() != ActorType::ItemEntity) continue;
+
+        auto*        itemActor = static_cast<ItemActor*>(actor);
+        BlockSource& bs        = actor->getDimensionBlockSource();
         items.push_back({itemActor, &bs});
     }
 
     size_t count = items.size();
 
-    if (count < 16) {
-        // 太少，直接走原版
-        origin();
-        return;
-    }
-
-    // 预先 tick 所有 ItemActor（主线程串行）
-    for (auto& e : items) {
-        if (e.actor->mRemoved || e.actor->isDead()) continue;
-        e.actor->tick(*e.region);
-    }
-
-    // 标记已处理的 ItemActor，让原版 tick 跳过它们
-    // 方法：临时设置一个极大的 age，让原版 tick 时 ItemActor 被视为"已处理"
-    // 不行，这会改变游戏行为...
-    //
-    // 更好的方法：直接调用 origin()，让原版 tick 正常执行。
-    // ItemActor 会被 tick 两次，但这是安全的（只是多算一帧物理）。
-    // 性能收益来自后续的优化（空间哈希 merge 等）。
-    //
-    // 但 tick 两次不是我们想要的。
-    //
-    // 真正的方案：不预先 tick，只优化 merge。
-    // 原版 tick 正常执行，我们 hook _mergeWithNeighbours 用空间哈希替代。
-
-    // 直接走原版 tick
+    // 始终调用原版 tick
     origin();
 
     auto elapsedUs = static_cast<uint64_t>(
@@ -206,7 +177,7 @@ bool ParallelItemTickMod::enable() {
 
     if (gConfig.stats) startStatsTask();
 
-    getLogger().info("Enabled — Level::$tick hook only, diagnostic build");
+    getLogger().info("Enabled — Level::$tick hook active");
     return true;
 }
 
