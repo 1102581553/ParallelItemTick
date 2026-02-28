@@ -7,7 +7,10 @@
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <ll/api/Config.h>
@@ -24,7 +27,6 @@
 #include <mc/world/actor/item/ItemActor.h>
 #include <mc/world/level/BlockSource.h>
 #include <mc/world/level/Level.h>
-#include <mc/world/phys/AABB.h>
 
 namespace parallel_item_tick {
 
@@ -50,19 +52,16 @@ public:
         }
     }
 
-    // 提交一批任务，等待全部完成
     void parallelFor(size_t count, size_t batchSize, std::function<void(size_t, size_t)> func) {
         if (count == 0) return;
 
-        std::atomic<size_t> completedBatches{0};
-        size_t              totalBatches = (count + batchSize - 1) / batchSize;
-
+        std::atomic<size_t>     completedBatches{0};
+        size_t                  totalBatches = (count + batchSize - 1) / batchSize;
         std::mutex              doneMutex;
         std::condition_variable doneCv;
 
         for (size_t batchStart = 0; batchStart < count; batchStart += batchSize) {
             size_t batchEnd = std::min(batchStart + batchSize, count);
-
             {
                 std::unique_lock lock(mMutex);
                 mTasks.push([&func, &completedBatches, &doneCv, batchStart, batchEnd] {
@@ -74,7 +73,6 @@ public:
             mCondition.notify_one();
         }
 
-        // 等待所有批次完成
         std::unique_lock lock(doneMutex);
         doneCv.wait(lock, [&] {
             return completedBatches.load(std::memory_order_acquire) >= totalBatches;
@@ -106,6 +104,54 @@ private:
 };
 
 static std::unique_ptr<ThreadPool> gThreadPool;
+
+// ============================================================
+// 延迟写操作队列
+// ============================================================
+static std::mutex                              gDeferredMutex;
+static std::vector<std::function<void()>>      gDeferredActions;
+
+static void deferAction(std::function<void()> action) {
+    std::lock_guard lock(gDeferredMutex);
+    gDeferredActions.push_back(std::move(action));
+}
+
+static void executeDeferredActions() {
+    std::vector<std::function<void()>> actions;
+    {
+        std::lock_guard lock(gDeferredMutex);
+        actions.swap(gDeferredActions);
+    }
+    for (auto& a : actions) {
+        a();
+    }
+}
+
+// ============================================================
+// 并行阶段标志
+// ============================================================
+static std::atomic<bool> gInParallelPhase{false};
+
+// ============================================================
+// 已处理集合
+// ============================================================
+static std::mutex                           gTickedMutex;
+static std::unordered_set<const Actor*>     gTickedItems;
+
+static void markTicked(const Actor* item) {
+    std::lock_guard lock(gTickedMutex);
+    gTickedItems.insert(item);
+}
+
+static bool wasTicked(const Actor* item) {
+    std::lock_guard lock(gTickedMutex);
+    return gTickedItems.count(item) > 0;
+}
+
+static void clearTicked() {
+    std::lock_guard lock(gTickedMutex);
+    gTickedItems.clear();
+}
 
 // ============================================================
 // 全局状态
@@ -181,47 +227,65 @@ void startStatsTask() {
 void stopStatsTask() { gStatsRunning = false; }
 
 // ============================================================
-// 标记集合：记录哪些 ItemActor 已被我们并行 tick 过
-// 每帧开始前清空，hook ItemActor::$tick 时检查跳过
-// ============================================================
-static std::mutex                          gTickedMutex;
-static std::unordered_set<const ItemActor*> gTickedItems;
-
-static void markTicked(const ItemActor* item) {
-    std::lock_guard lock(gTickedMutex);
-    gTickedItems.insert(item);
-}
-
-static bool wasTicked(const ItemActor* item) {
-    std::lock_guard lock(gTickedMutex);
-    return gTickedItems.count(item) > 0;
-}
-
-static void clearTicked() {
-    std::lock_guard lock(gTickedMutex);
-    gTickedItems.clear();
-}
-
-// ============================================================
-// Hook: ItemActor::$tick — 跳过已被并行处理的
+// Hook: Actor::normalTick — 拦截 ItemActor 的 normalTick
+// 在并行阶段由工作线程调用，原版阶段跳过已处理的
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
-    ItemActorTickHook,
+    ActorNormalTickHook,
     ll::memory::HookPriority::Normal,
-    ItemActor,
-    &ItemActor::$tick,
-    void,
-    BlockSource& region
+    Actor,
+    &Actor::$normalTick,
+    void
 ) {
-    if (gConfig.enabled && wasTicked(this)) {
-        // 已经在并行阶段 tick 过了，跳过
+    if (!gConfig.enabled) {
+        origin();
         return;
     }
-    origin(region);
+
+    // 只拦截 ItemActor
+    if (this->getEntityTypeId() != ActorType::ItemEntity) {
+        origin();
+        return;
+    }
+
+    // 如果在并行阶段，直接执行（由工作线程调用）
+    if (gInParallelPhase.load(std::memory_order_acquire)) {
+        origin();
+        return;
+    }
+
+    // 非并行阶段（原版 Level::tick 调用），跳过已处理的
+    if (wasTicked(this)) {
+        return;
+    }
+
+    origin();
 }
 
 // ============================================================
-// Hook: Level::$tick — 并行处理 ItemActor
+// Hook: Actor::$remove — 并行阶段延迟移除
+// ============================================================
+LL_TYPE_INSTANCE_HOOK(
+    ActorRemoveHook,
+    ll::memory::HookPriority::Normal,
+    Actor,
+    &Actor::$remove,
+    void
+) {
+    if (gInParallelPhase.load(std::memory_order_acquire) &&
+        this->getEntityTypeId() == ActorType::ItemEntity) {
+        this->mRemoved = true;
+        Actor* self = this;
+        deferAction([self] {
+            self->$remove();
+        });
+        return;
+    }
+    origin();
+}
+
+// ============================================================
+// Hook: Level::$tick — 主逻辑
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -237,7 +301,6 @@ LL_TYPE_INSTANCE_HOOK(
 
     auto tickStart = std::chrono::steady_clock::now();
 
-    // 清除上一帧的标记
     clearTicked();
 
     // 收集 ItemActor
@@ -262,7 +325,9 @@ LL_TYPE_INSTANCE_HOOK(
     size_t count = items.size();
 
     if (count > 0) {
-        // 并行阶段：每个线程处理一批 ItemActor 的 tick
+        // 进入并行阶段
+        gInParallelPhase.store(true, std::memory_order_release);
+
         gThreadPool->parallelFor(
             count,
             static_cast<size_t>(gConfig.batchSize),
@@ -271,17 +336,23 @@ LL_TYPE_INSTANCE_HOOK(
                     auto& e = items[i];
                     if (e.actor->mRemoved || e.actor->isDead()) continue;
 
-                    // 调用原版 ItemActor::$tick
-                    e.actor->$tick(*e.region);
+                    // 调用 Actor::tick，它内部会调用 normalTick
+                    // normalTick hook 在并行阶段会放行
+                    e.actor->tick(*e.region);
 
-                    // 标记为已处理，原版 Level::tick 遍历时会跳过
                     markTicked(e.actor);
                 }
             }
         );
+
+        // 退出并行阶段
+        gInParallelPhase.store(false, std::memory_order_release);
+
+        // 执行延迟操作
+        executeDeferredActions();
     }
 
-    // 调用原版 Level::$tick，其中 ItemActor::$tick 会被 hook 跳过
+    // 原版 tick，已处理的 ItemActor 的 normalTick 会被跳过
     origin();
 
     auto elapsedUs = static_cast<uint64_t>(
@@ -332,7 +403,6 @@ bool ParallelItemTickMod::enable() {
         return true;
     }
 
-    // 初始化线程池
     int threads = gConfig.numThreads;
     if (threads <= 0) {
         threads = static_cast<int>(std::thread::hardware_concurrency()) - 1;
@@ -341,7 +411,8 @@ bool ParallelItemTickMod::enable() {
     gThreadPool = std::make_unique<ThreadPool>(static_cast<size_t>(threads));
 
     LevelTickHook::hook();
-    ItemActorTickHook::hook();
+    ActorNormalTickHook::hook();
+    ActorRemoveHook::hook();
 
     if (gConfig.stats) startStatsTask();
 
@@ -351,7 +422,8 @@ bool ParallelItemTickMod::enable() {
 
 bool ParallelItemTickMod::disable() {
     stopStatsTask();
-    ItemActorTickHook::unhook();
+    ActorRemoveHook::unhook();
+    ActorNormalTickHook::unhook();
     LevelTickHook::unhook();
     gThreadPool.reset();
     clearTicked();
