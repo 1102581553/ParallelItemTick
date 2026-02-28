@@ -40,7 +40,17 @@ jobs:
             pkgs-
 
       - name: Clean output
-        run: if (Test-Path "bin") { Remove-Item -Recurse -Force "bin" }
+        run: |
+          if (Test-Path "bin") {
+            Write-Host "Found existing bin directory, listing contents:"
+            Get-ChildItem -Recurse "bin" | ForEach-Object {
+              Write-Host "  $($_.FullName) ($([math]::Round($_.Length / 1KB, 2)) KB, $($_.LastWriteTime))"
+            }
+            Remove-Item -Recurse -Force "bin"
+            Write-Host "bin directory removed."
+          } else {
+            Write-Host "bin directory does not exist, nothing to clean."
+          }
         shell: pwsh
 
       - name: Build
