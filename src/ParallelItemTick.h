@@ -18,6 +18,9 @@ namespace ll::io {
 class Logger;
 }
 
+class BlockSource;
+class Dimension;
+
 namespace parallel_item_tick {
 
 struct Config {
@@ -29,10 +32,6 @@ struct Config {
     int  workerThreads  = 0;
 };
 
-// ────────────────────────────────────────────
-// 线程池：用 mutex+cv 替代 atomic::wait，
-// 消除原版 generation 竞态
-// ────────────────────────────────────────────
 class TickWorkerPool {
 public:
     explicit TickWorkerPool(int numWorkers);
@@ -41,8 +40,9 @@ public:
     TickWorkerPool(TickWorkerPool const&)            = delete;
     TickWorkerPool& operator=(TickWorkerPool const&) = delete;
 
-    // 对 [0, count) 并行执行 func(i)
     void parallelFor(size_t count, std::function<void(size_t)> const& func);
+
+    int getNumWorkers() const { return mNumWorkers; }
 
 private:
     void workerMain();
@@ -50,24 +50,19 @@ private:
     int                      mNumWorkers;
     std::vector<std::thread> mWorkers;
 
-    // 同步原语
     std::mutex              mMutex;
-    std::condition_variable mWorkCv;   // 通知 worker 有新任务
-    std::condition_variable mDoneCv;   // 通知主线程任务完成
+    std::condition_variable mWorkCv;
+    std::condition_variable mDoneCv;
 
     bool     mShutdown{false};
     uint64_t mGeneration{0};
 
-    // 任务描述
     std::function<void(size_t)> const* mWorkFunc{nullptr};
     size_t                             mWorkCount{0};
     std::atomic<size_t>                mNextIndex{0};
     int                                mActiveWorkers{0};
 };
 
-// ────────────────────────────────────────────
-// 全局状态
-// ────────────────────────────────────────────
 extern Config                          gConfig;
 extern std::shared_ptr<ll::io::Logger> gLogger;
 extern bool                            gStatsRunning;
@@ -87,9 +82,6 @@ bool            saveConfig();
 void            startStatsTask();
 void            stopStatsTask();
 
-// ────────────────────────────────────────────
-// 插件主类
-// ────────────────────────────────────────────
 class ParallelItemTickMod {
 public:
     static ParallelItemTickMod& getInstance();
