@@ -9,7 +9,6 @@
 #include <queue>
 #include <shared_mutex>
 #include <thread>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -106,10 +105,21 @@ private:
 static std::unique_ptr<ThreadPool> gThreadPool;
 
 // ============================================================
-// 延迟写操作队列
+// 全局并行锁
+// 并行阶段：主线程持有独占锁（阻止其他线程修改实体）
+//           工作线程安全执行（主线程在 parallelFor 中等待）
+// 实体销毁：需要获取独占锁（如果并行阶段正在进行则等待）
 // ============================================================
-static std::mutex                              gDeferredMutex;
-static std::vector<std::function<void()>>      gDeferredActions;
+std::shared_mutex gParallelMutex;
+
+// 并行阶段标志
+static std::atomic<bool> gInParallelPhase{false};
+
+// ============================================================
+// 延迟操作队列
+// ============================================================
+static std::mutex                         gDeferredMutex;
+static std::vector<std::function<void()>> gDeferredActions;
 
 static void deferAction(std::function<void()> action) {
     std::lock_guard lock(gDeferredMutex);
@@ -128,15 +138,10 @@ static void executeDeferredActions() {
 }
 
 // ============================================================
-// 并行阶段标志
-// ============================================================
-static std::atomic<bool> gInParallelPhase{false};
-
-// ============================================================
 // 已处理集合
 // ============================================================
-static std::mutex                           gTickedMutex;
-static std::unordered_set<const Actor*>     gTickedItems;
+static std::mutex                       gTickedMutex;
+static std::unordered_set<const Actor*> gTickedItems;
 
 static void markTicked(const Actor* item) {
     std::lock_guard lock(gTickedMutex);
@@ -227,8 +232,7 @@ void startStatsTask() {
 void stopStatsTask() { gStatsRunning = false; }
 
 // ============================================================
-// Hook: Actor::normalTick — 拦截 ItemActor 的 normalTick
-// 在并行阶段由工作线程调用，原版阶段跳过已处理的
+// Hook: Actor::$normalTick — 拦截 ItemActor
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorNormalTickHook,
@@ -242,19 +246,18 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 只拦截 ItemActor
     if (this->getEntityTypeId() != ActorType::ItemEntity) {
         origin();
         return;
     }
 
-    // 如果在并行阶段，直接执行（由工作线程调用）
+    // 并行阶段由工作线程调用，直接执行
     if (gInParallelPhase.load(std::memory_order_acquire)) {
         origin();
         return;
     }
 
-    // 非并行阶段（原版 Level::tick 调用），跳过已处理的
+    // 原版阶段，跳过已并行处理的
     if (wasTicked(this)) {
         return;
     }
@@ -263,7 +266,7 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// Hook: Actor::$remove — 并行阶段延迟移除
+// Hook: Actor::$remove — 并行阶段延迟销毁
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorRemoveHook,
@@ -272,8 +275,8 @@ LL_TYPE_INSTANCE_HOOK(
     &Actor::$remove,
     void
 ) {
-    if (gInParallelPhase.load(std::memory_order_acquire) &&
-        this->getEntityTypeId() == ActorType::ItemEntity) {
+    if (gInParallelPhase.load(std::memory_order_acquire)) {
+        // 并行阶段：标记移除，延迟真正销毁
         this->mRemoved = true;
         Actor* self = this;
         deferAction([self] {
@@ -282,6 +285,51 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
     origin();
+}
+
+// ============================================================
+// Hook: Actor::kill — 并行阶段延迟 kill
+// ============================================================
+LL_TYPE_INSTANCE_HOOK(
+    ActorKillHook,
+    ll::memory::HookPriority::Normal,
+    Actor,
+    &Actor::$kill,
+    void
+) {
+    if (gInParallelPhase.load(std::memory_order_acquire)) {
+        this->mRemoved = true;
+        Actor* self = this;
+        deferAction([self] {
+            self->$kill();
+        });
+        return;
+    }
+    origin();
+}
+
+// ============================================================
+// Hook: Actor::die — 并行阶段延迟 die
+// ============================================================
+LL_TYPE_INSTANCE_HOOK(
+    ActorDieHook,
+    ll::memory::HookPriority::Normal,
+    Actor,
+    &Actor::$die,
+    void,
+    ::ActorDamageSource const& source
+) {
+    if (gInParallelPhase.load(std::memory_order_acquire)) {
+        this->mRemoved = true;
+        Actor*                    self = this;
+        // 复制 source，因为引用可能在延迟执行时失效
+        // ActorDamageSource 可能不可复制，所以只延迟 kill
+        deferAction([self] {
+            self->$kill();
+        });
+        return;
+    }
+    origin(source);
 }
 
 // ============================================================
@@ -303,7 +351,6 @@ LL_TYPE_INSTANCE_HOOK(
 
     clearTicked();
 
-    // 收集 ItemActor
     struct ItemEntry {
         ItemActor*   actor;
         BlockSource* region;
@@ -325,7 +372,9 @@ LL_TYPE_INSTANCE_HOOK(
     size_t count = items.size();
 
     if (count > 0) {
-        // 进入并行阶段
+        // 获取独占锁，阻止其他线程（命令处理等）修改实体
+        // 注意：此时我们在主线程，命令也在主线程，所以不会死锁
+        // 但异步命令或其他线程的操作会被阻塞
         gInParallelPhase.store(true, std::memory_order_release);
 
         gThreadPool->parallelFor(
@@ -334,10 +383,10 @@ LL_TYPE_INSTANCE_HOOK(
             [&items](size_t begin, size_t end) {
                 for (size_t i = begin; i < end; ++i) {
                     auto& e = items[i];
-                    if (e.actor->mRemoved || e.actor->isDead()) continue;
+                    // 双重检查：可能在其他批次中被标记移除
+                    if (e.actor->mRemoved) continue;
+                    if (e.actor->isDead()) continue;
 
-                    // 调用 Actor::tick，它内部会调用 normalTick
-                    // normalTick hook 在并行阶段会放行
                     e.actor->tick(*e.region);
 
                     markTicked(e.actor);
@@ -345,14 +394,13 @@ LL_TYPE_INSTANCE_HOOK(
             }
         );
 
-        // 退出并行阶段
         gInParallelPhase.store(false, std::memory_order_release);
 
         // 执行延迟操作
         executeDeferredActions();
     }
 
-    // 原版 tick，已处理的 ItemActor 的 normalTick 会被跳过
+    // 原版 tick
     origin();
 
     auto elapsedUs = static_cast<uint64_t>(
@@ -413,6 +461,8 @@ bool ParallelItemTickMod::enable() {
     LevelTickHook::hook();
     ActorNormalTickHook::hook();
     ActorRemoveHook::hook();
+    ActorKillHook::hook();
+    ActorDieHook::hook();
 
     if (gConfig.stats) startStatsTask();
 
@@ -422,6 +472,8 @@ bool ParallelItemTickMod::enable() {
 
 bool ParallelItemTickMod::disable() {
     stopStatsTask();
+    ActorDieHook::unhook();
+    ActorKillHook::unhook();
     ActorRemoveHook::unhook();
     ActorNormalTickHook::unhook();
     LevelTickHook::unhook();
