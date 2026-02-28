@@ -21,6 +21,7 @@
 #include <mc/world/actor/item/ItemActor.h>
 #include <mc/world/level/BlockSource.h>
 #include <mc/world/level/Level.h>
+#include <mc/world/level/chunk/ChunkSource.h>
 #include <mc/world/level/dimension/Dimension.h>
 
 namespace parallel_item_tick {
@@ -40,6 +41,42 @@ std::atomic<uint64_t> gTotalProcessed{0};
 std::atomic<uint64_t> gTotalMerged{0};
 std::atomic<uint64_t> gTotalTimeUs{0};
 std::atomic<uint64_t> gMaxTimeUs{0};
+
+// ============================================================
+// Per-dimension 的 per-thread BlockSource 池
+// key = DimensionType, value = vector<unique_ptr<BlockSource>>
+// 每个 vector 的大小 = workerThreads + 1（+1 给主线程）
+// ============================================================
+struct DimBlockSources {
+    Dimension*                                  dimension{nullptr};
+    std::vector<std::unique_ptr<BlockSource>>   sources;
+};
+static std::unordered_map<int, DimBlockSources> gBlockSourcePool;
+
+static void ensureBlockSources(Dimension& dim, int totalSlots) {
+    int dimId = static_cast<int>(dim.getDimensionId());
+    auto& entry = gBlockSourcePool[dimId];
+    if (entry.sources.size() >= static_cast<size_t>(totalSlots)) return;
+
+    entry.dimension = &dim;
+    entry.sources.reserve(totalSlots);
+    while (entry.sources.size() < static_cast<size_t>(totalSlots)) {
+        // 构造一个独立的 BlockSource，绑定到同一个 Dimension 和 ChunkSource
+        // 这样每个线程有自己的 mTempCubeList、mTempEntityList、mLastChunk 缓存
+        entry.sources.push_back(std::make_unique<BlockSource>(
+            dim.getLevel(),
+            dim,
+            dim.getChunkSource(),
+            true,   // publicSource
+            false,  // allowUnpopulatedChunks
+            false   // allowClientTickingChanges
+        ));
+    }
+}
+
+static void clearBlockSourcePool() {
+    gBlockSourcePool.clear();
+}
 
 // ============================================================
 // 工具函数
@@ -114,7 +151,7 @@ void startStatsTask() {
 void stopStatsTask() { gStatsRunning = false; }
 
 // ============================================================
-// TickWorkerPool — mutex+cv 实现，无竞态
+// TickWorkerPool
 // ============================================================
 TickWorkerPool::TickWorkerPool(int numWorkers) : mNumWorkers(numWorkers) {
     for (int i = 0; i < numWorkers; i++) {
@@ -136,14 +173,11 @@ TickWorkerPool::~TickWorkerPool() {
 void TickWorkerPool::parallelFor(size_t count, std::function<void(size_t)> const& func) {
     if (count == 0) return;
 
-    // 任务太少，主线程直接串行
-    if (count < static_cast<size_t>(gConfig.minParallelCnt) ||
-        mNumWorkers == 0) {
+    if (count < static_cast<size_t>(gConfig.minParallelCnt) || mNumWorkers == 0) {
         for (size_t i = 0; i < count; i++) func(i);
         return;
     }
 
-    // 发布任务
     {
         std::lock_guard lock(mMutex);
         mWorkFunc      = &func;
@@ -154,14 +188,13 @@ void TickWorkerPool::parallelFor(size_t count, std::function<void(size_t)> const
     }
     mWorkCv.notify_all();
 
-    // 主线程也参与抢任务
+    // 主线程也参与
     while (true) {
         size_t idx = mNextIndex.fetch_add(1, std::memory_order_acq_rel);
         if (idx >= count) break;
         func(idx);
     }
 
-    // 等待所有 worker 完成
     {
         std::unique_lock lock(mMutex);
         mDoneCv.wait(lock, [this] { return mActiveWorkers == 0; });
@@ -173,7 +206,6 @@ void TickWorkerPool::parallelFor(size_t count, std::function<void(size_t)> const
 void TickWorkerPool::workerMain() {
     uint64_t lastGen = 0;
     while (true) {
-        // 等待新任务或关闭信号
         {
             std::unique_lock lock(mMutex);
             mWorkCv.wait(lock, [this, lastGen] {
@@ -183,18 +215,14 @@ void TickWorkerPool::workerMain() {
             lastGen = mGeneration;
         }
 
-        // 抢任务执行
         while (true) {
             size_t idx = mNextIndex.fetch_add(1, std::memory_order_acq_rel);
             if (idx >= mWorkCount) break;
             try {
                 (*mWorkFunc)(idx);
-            } catch (...) {
-                // 吞掉异常，防止 worker 线程意外退出
-            }
+            } catch (...) {}
         }
 
-        // 通知主线程
         {
             std::lock_guard lock(mMutex);
             mActiveWorkers--;
@@ -204,30 +232,40 @@ void TickWorkerPool::workerMain() {
 }
 
 // ============================================================
-// Chunk 坐标哈希，用于分组
+// 线程槽位分配
+// parallelFor 的 lambda 需要知道自己是哪个线程，
+// 以便选择对应的 BlockSource
+// 主线程 = slot 0, worker 线程 = slot 1..N
+// ============================================================
+static thread_local int tSlotId = -1;
+static std::atomic<int> gNextSlot{1};
+
+static int getSlotId() {
+    if (tSlotId < 0) {
+        tSlotId = gNextSlot.fetch_add(1, std::memory_order_relaxed);
+    }
+    return tSlotId;
+}
+
+// ============================================================
+// Chunk 分组
 // ============================================================
 struct ChunkKey {
+    int dimId;
     int x, z;
-    bool operator==(ChunkKey const& o) const { return x == o.x && z == o.z; }
+    bool operator==(ChunkKey const& o) const {
+        return dimId == o.dimId && x == o.x && z == o.z;
+    }
 };
 
 struct ChunkKeyHash {
     size_t operator()(ChunkKey const& k) const {
-        // 简单但足够的哈希
-        return std::hash<int64_t>()(static_cast<int64_t>(k.x) << 32 | static_cast<uint32_t>(k.z));
+        size_t h = std::hash<int>()(k.dimId);
+        h ^= std::hash<int>()(k.x) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>()(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
     }
 };
-
-// ============================================================
-// 从 Actor 位置计算 chunk 坐标
-// ============================================================
-static ChunkKey getChunkKey(Actor* actor) {
-    auto const& pos = actor->getPosition();
-    return {
-        static_cast<int>(std::floor(pos.x)) >> 4,
-        static_cast<int>(std::floor(pos.z)) >> 4
-    };
-}
 
 // ============================================================
 // Hook: Actor::tick — 跳过已并行处理的 ItemActor
@@ -247,7 +285,15 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// Hook: Level::$tick — 主逻辑，棋盘格并行
+// Hook: Level::$tick — 主逻辑
+//
+// 策略：
+// 1. 收集所有 ItemActor，按 dimension + chunk 分组
+// 2. 为每个 dimension 创建 per-thread BlockSource 实例
+// 3. 棋盘格分 4 phase，每 phase 内并行（不同 chunk 间）
+// 4. 每个线程使用自己的 BlockSource 调用 tick()
+// 5. 串行 merge
+// 6. 原版 tick 跳过已处理的 ItemActor
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -263,11 +309,13 @@ LL_TYPE_INSTANCE_HOOK(
 
     auto tickStart = std::chrono::steady_clock::now();
 
-    // ── 收集所有存活的 ItemActor ──
+    // ── 收集 ──
     struct ItemEntry {
         ItemActor*   actor;
-        BlockSource* region;
-        ChunkKey     chunk;
+        Dimension*   dim;
+        int          dimId;
+        int          chunkX;
+        int          chunkZ;
     };
 
     std::vector<ItemEntry> items;
@@ -278,8 +326,15 @@ LL_TYPE_INSTANCE_HOOK(
         if (!actor || actor->mRemoved) continue;
         auto* itemActor = dynamic_cast<ItemActor*>(actor);
         if (!itemActor) continue;
-        BlockSource& bs = actor->getDimensionBlockSource();
-        items.push_back({itemActor, &bs, getChunkKey(actor)});
+
+        auto const& pos = actor->getPosition();
+        int cx = static_cast<int>(std::floor(pos.x)) >> 4;
+        int cz = static_cast<int>(std::floor(pos.z)) >> 4;
+
+        Dimension& dim = actor->getDimension();
+        int dimId = static_cast<int>(dim.getDimensionId());
+
+        items.push_back({itemActor, &dim, dimId, cx, cz});
     }
 
     size_t count = items.size();
@@ -292,51 +347,74 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
+    // ── 准备 per-thread BlockSource ──
+    int totalSlots = gWorkerPool->getNumWorkers() + 1;
+
+    // 收集涉及的 dimension
+    std::unordered_map<int, Dimension*> involvedDims;
+    for (auto& e : items) {
+        involvedDims[e.dimId] = e.dim;
+    }
+    for (auto& [dimId, dim] : involvedDims) {
+        ensureBlockSources(*dim, totalSlots);
+    }
+
+    // 主线程 slot = 0
+    tSlotId = 0;
+    gNextSlot.store(1, std::memory_order_relaxed);
+
     // ── 按 chunk 分组 ──
-    // key = ChunkKey, value = 该 chunk 内的 item 索引列表
     std::unordered_map<ChunkKey, std::vector<size_t>, ChunkKeyHash> chunkMap;
     chunkMap.reserve(count / 4);
     for (size_t i = 0; i < count; i++) {
-        chunkMap[items[i].chunk].push_back(i);
+        ChunkKey key{items[i].dimId, items[i].chunkX, items[i].chunkZ};
+        chunkMap[key].push_back(i);
     }
 
-    // ── 棋盘格分 4 个 phase ──
-    // phase 由 (chunkX % 2, chunkZ % 2) 决定
-    // 同一 phase 内的 chunk 互不相邻，可以安全并行
-    // 不同 phase 串行执行
+    // ── 棋盘格分 4 phase ──
+    // phase = ((chunkX & 1) << 1) | (chunkZ & 1)
+    // 同一 phase 内的 chunk 曼哈顿距离 >= 2
     std::vector<std::vector<size_t>> phases[4];
 
     for (auto& [key, indices] : chunkMap) {
-        // C++ 的 % 对负数可能返回负值，用位运算确保 0 或 1
         int px = key.x & 1;
         int pz = key.z & 1;
+        if (px < 0) px += 2;
+        if (pz < 0) pz += 2;
         int phase = (px << 1) | pz;
-        // 每个 chunk 的所有 item 作为一个工作单元
         phases[phase].push_back(std::move(indices));
     }
 
-    size_t mergeCount = 0;
-
-    // ── 分 4 个 phase 执行 ──
+    // ── 执行 4 个 phase ──
     for (int p = 0; p < 4; p++) {
         auto& chunks = phases[p];
         if (chunks.empty()) continue;
 
-        // parallelFor 的粒度是 chunk（不是单个 item）
-        // 同一 chunk 内的 item 串行 tick，不同 chunk 并行
         gWorkerPool->parallelFor(chunks.size(), [&](size_t chunkIdx) {
+            int slot = getSlotId();
+
             for (size_t itemIdx : chunks[chunkIdx]) {
                 auto& e = items[itemIdx];
+
+                // 获取该线程专属的 BlockSource
+                auto& pool = gBlockSourcePool[e.dimId];
+                int safeSlot = slot < static_cast<int>(pool.sources.size())
+                    ? slot : 0;
+                BlockSource& threadBS = *pool.sources[safeSlot];
+
                 try {
-                    e.actor->tick(*e.region);
-                } catch (...) {
-                    // 防止单个实体异常导致整个 phase 崩溃
-                }
+                    e.actor->tick(threadBS);
+                } catch (...) {}
             }
         });
+
+        // 重置 slot 分配，下一个 phase 重新分配
+        tSlotId = 0;
+        gNextSlot.store(1, std::memory_order_relaxed);
     }
 
-    // ── 串行 merge ──
+    // ── 串行 merge（用原始 BlockSource）──
+    size_t mergeCount = 0;
     for (auto& e : items) {
         if (e.actor->mRemoved || e.actor->isDead()) continue;
         try {
@@ -369,7 +447,7 @@ LL_TYPE_INSTANCE_HOOK(
 
     if (gConfig.debug) {
         getLogger().info(
-            "Tick: {} items, {} chunks, {:.2f}ms",
+            "Tick: {} items, {} chunks, 4 phases, {:.2f}ms",
             count, chunkMap.size(), elapsedUs / 1000.0
         );
     }
@@ -411,8 +489,8 @@ bool ParallelItemTickMod::enable() {
     if (gConfig.stats) startStatsTask();
 
     getLogger().info(
-        "Enabled with {} workers, minParallelCnt={}, checkerboard parallel",
-        gConfig.workerThreads, gConfig.minParallelCnt
+        "Enabled with {} workers, per-thread BlockSource, checkerboard parallel",
+        gConfig.workerThreads
     );
     return true;
 }
@@ -424,6 +502,7 @@ bool ParallelItemTickMod::disable() {
     LevelTickHook::unhook();
 
     gWorkerPool.reset();
+    clearBlockSourcePool();
     gSkipProcessedItems = false;
 
     getLogger().info("Disabled");
