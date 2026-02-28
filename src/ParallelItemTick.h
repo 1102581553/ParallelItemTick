@@ -1,4 +1,3 @@
-// ParallelItemTick.h
 #pragma once
 
 #include <atomic>
@@ -9,6 +8,7 @@
 #include <latch>
 #include <vector>
 
+#include <ll/api/Config.h>
 #include <ll/api/mod/NativeMod.h>
 
 namespace ll::io {
@@ -42,14 +42,14 @@ private:
     void workerMain(int id);
     void executeWork();
 
-    int                                 mNumWorkers;
-    std::vector<std::thread>            mWorkers;
-    std::atomic<bool>                   mShutdown{false};
-    std::atomic<uint64_t>               mGeneration{0};
-    std::function<void(size_t)> const*  mWorkFunc{nullptr};
-    size_t                              mWorkCount{0};
-    std::atomic<size_t>                 mNextIndex{0};
-    std::latch*                         mDoneLatch{nullptr};
+    int                                mNumWorkers;
+    std::vector<std::thread>           mWorkers;
+    std::atomic<bool>                  mShutdown{false};
+    std::atomic<uint64_t>              mGeneration{0};
+    std::function<void(size_t)> const* mWorkFunc{nullptr};
+    size_t                             mWorkCount{0};
+    std::atomic<size_t>                mNextIndex{0};
+    std::latch*                        mDoneLatch{nullptr};
 };
 
 extern Config                          gConfig;
@@ -76,10 +76,10 @@ class ParallelItemTickMod {
 public:
     static ParallelItemTickMod& getInstance();
 
-    ParallelItemTickMod();
+    // 和参考插件一样，构造函数内联在头文件里
+    ParallelItemTickMod() : mSelf(*ll::mod::NativeMod::current()) {}
 
-    // 只声明，不在头文件里定义函数体
-    [[nodiscard]] ll::mod::NativeMod& getSelf() const;
+    [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
 
     bool load();
     bool enable();
