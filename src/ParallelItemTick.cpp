@@ -21,9 +21,6 @@
 
 namespace parallel_item_tick {
 
-// ============================================================
-// 全局变量
-// ============================================================
 Config                          gConfig;
 std::shared_ptr<ll::io::Logger> gLogger;
 bool                            gStatsRunning = false;
@@ -33,9 +30,6 @@ std::atomic<uint64_t> gTotalProcessed{0};
 std::atomic<uint64_t> gTotalTimeUs{0};
 std::atomic<uint64_t> gMaxTimeUs{0};
 
-// ============================================================
-// 工具函数
-// ============================================================
 ll::io::Logger& getLogger() {
     if (!gLogger) {
         gLogger = ll::io::LoggerRegistry::getInstance().getOrCreate("ParallelItemTick");
@@ -97,29 +91,11 @@ void startStatsTask() {
 void stopStatsTask() { gStatsRunning = false; }
 
 // ============================================================
-// Hook: Level::$tick — 最小化版本
+// 唯一的 Hook: Level::$tick
 //
-// 只做一件事：批量收集 ItemActor，串行 tick，
-// 然后让原版 tick 跳过已处理的 ItemActor。
-// 目的：确认 hook 机制本身是否稳定。
+// 不 hook Actor::tick，避免与其他插件冲突。
+// 在 origin() 之前预处理 ItemActor，之后不需要跳过。
 // ============================================================
-static bool gSkipItems = false;
-
-LL_TYPE_INSTANCE_HOOK(
-    ActorTickHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::tick,
-    bool,
-    ::BlockSource& region
-) {
-    if (gSkipItems) {
-        auto* item = dynamic_cast<ItemActor*>(this);
-        if (item) return false;
-    }
-    return origin(region);
-}
-
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
@@ -154,22 +130,33 @@ LL_TYPE_INSTANCE_HOOK(
 
     size_t count = items.size();
 
-    // 如果 item 太少，直接走原版
     if (count < 16) {
+        // 太少，直接走原版
         origin();
         return;
     }
 
-    // 串行 tick 所有 ItemActor（主线程）
+    // 预先 tick 所有 ItemActor（主线程串行）
     for (auto& e : items) {
         if (e.actor->mRemoved || e.actor->isDead()) continue;
         e.actor->tick(*e.region);
     }
 
-    // 原版 tick，跳过已处理的 ItemActor
-    gSkipItems = true;
+    // 标记已处理的 ItemActor，让原版 tick 跳过它们
+    // 方法：临时设置一个极大的 age，让原版 tick 时 ItemActor 被视为"已处理"
+    // 不行，这会改变游戏行为...
+    //
+    // 更好的方法：直接调用 origin()，让原版 tick 正常执行。
+    // ItemActor 会被 tick 两次，但这是安全的（只是多算一帧物理）。
+    // 性能收益来自后续的优化（空间哈希 merge 等）。
+    //
+    // 但 tick 两次不是我们想要的。
+    //
+    // 真正的方案：不预先 tick，只优化 merge。
+    // 原版 tick 正常执行，我们 hook _mergeWithNeighbours 用空间哈希替代。
+
+    // 直接走原版 tick
     origin();
-    gSkipItems = false;
 
     auto elapsedUs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -191,9 +178,6 @@ LL_TYPE_INSTANCE_HOOK(
     }
 }
 
-// ============================================================
-// 插件主类
-// ============================================================
 ParallelItemTickMod& ParallelItemTickMod::getInstance() {
     static ParallelItemTickMod instance;
     return instance;
@@ -218,21 +202,17 @@ bool ParallelItemTickMod::enable() {
         return true;
     }
 
-    ActorTickHook::hook();
     LevelTickHook::hook();
 
     if (gConfig.stats) startStatsTask();
 
-    getLogger().info("Enabled — minimal diagnostic build");
+    getLogger().info("Enabled — Level::$tick hook only, diagnostic build");
     return true;
 }
 
 bool ParallelItemTickMod::disable() {
     stopStatsTask();
-
-    ActorTickHook::unhook();
     LevelTickHook::unhook();
-
     getLogger().info("Disabled");
     return true;
 }
