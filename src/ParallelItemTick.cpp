@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <unordered_set>
 #include <vector>
 
 #include <ll/api/Config.h>
@@ -27,11 +28,13 @@ namespace parallel_item_tick {
 // ============================================================
 Config                          gConfig;
 std::shared_ptr<ll::io::Logger> gLogger;
-bool                            gStatsRunning    = false;
+bool                            gStatsRunning = false;
 std::unique_ptr<TickWorkerPool> gWorkerPool;
 
-thread_local bool gSuppressMerge      = false;
-bool              gSkipProcessedItems = false;
+// 已被并行处理的 ItemActor 指针集合（主线程独占）
+std::unordered_set<void*> gProcessedActors;
+
+thread_local bool gSuppressMerge = false;
 
 std::atomic<uint64_t> gTotalTicks{0};
 std::atomic<uint64_t> gTotalProcessed{0};
@@ -55,7 +58,7 @@ ll::io::Logger& getLogger() {
 bool loadConfig() {
     auto path = ParallelItemTickMod::getInstance().getSelf().getConfigDir() / "config.json";
     if (!std::filesystem::exists(path)) {
-        getLogger().info("Config not found, creating default config.json");
+        getLogger().info("Config not found, creating default");
         return saveConfig();
     }
     if (!ll::config::loadConfig(gConfig, path)) {
@@ -88,20 +91,20 @@ void startStatsTask() {
             ll::thread::ServerThreadExecutor::getDefault().execute([] {
                 if (!gConfig.stats) return;
 
-                auto totalTicks   = gTotalTicks.load(std::memory_order_relaxed);
-                auto totalProcess = gTotalProcessed.load(std::memory_order_relaxed);
-                auto totalMerged  = gTotalMerged.load(std::memory_order_relaxed);
-                auto totalTime    = gTotalTimeUs.load(std::memory_order_relaxed);
-                auto maxTime      = gMaxTimeUs.load(std::memory_order_relaxed);
+                auto ticks   = gTotalTicks.load(std::memory_order_relaxed);
+                auto process = gTotalProcessed.load(std::memory_order_relaxed);
+                auto merged  = gTotalMerged.load(std::memory_order_relaxed);
+                auto time    = gTotalTimeUs.load(std::memory_order_relaxed);
+                auto maxT    = gMaxTimeUs.load(std::memory_order_relaxed);
 
                 getLogger().info(
-                    "Stats (5s): frames={}, items/frame={:.1f}, merges/frame={:.1f}, "
-                    "avgTime={:.2f}ms, maxTime={:.2f}ms",
-                    totalTicks,
-                    totalTicks ? (double)totalProcess / totalTicks : 0.0,
-                    totalTicks ? (double)totalMerged  / totalTicks : 0.0,
-                    totalTicks ? (double)totalTime    / totalTicks / 1000.0 : 0.0,
-                    (double)maxTime / 1000.0
+                    "Stats(5s): frames={}, items/f={:.1f}, merges/f={:.1f}, "
+                    "avg={:.2f}ms, max={:.2f}ms",
+                    ticks,
+                    ticks ? (double)process / ticks : 0.0,
+                    ticks ? (double)merged   / ticks : 0.0,
+                    ticks ? (double)time     / ticks / 1000.0 : 0.0,
+                    (double)maxT / 1000.0
                 );
 
                 gTotalTicks.store(0,     std::memory_order_relaxed);
@@ -118,7 +121,7 @@ void startStatsTask() {
 void stopStatsTask() { gStatsRunning = false; }
 
 // ============================================================
-// TickWorkerPool — mutex+condvar 实现，无栈悬空问题
+// TickWorkerPool
 // ============================================================
 TickWorkerPool::TickWorkerPool(int numWorkers) : mNumWorkers(numWorkers) {
     for (int i = 0; i < numWorkers; i++) {
@@ -140,64 +143,54 @@ TickWorkerPool::~TickWorkerPool() {
 void TickWorkerPool::parallelFor(size_t count, std::function<void(size_t)> const& func) {
     if (count == 0) return;
 
-    // 任务太少直接串行，避免线程调度开销
-    if (count < (size_t)gConfig.minParallelCnt || mNumWorkers == 0) {
+    if (mNumWorkers == 0 || count < (size_t)gConfig.minParallelCnt) {
         for (size_t i = 0; i < count; i++) func(i);
         return;
     }
 
     {
         std::lock_guard lock(mMutex);
-        mWorkFunc      = &func;
-        mWorkCount     = count;
+        mWorkFunc     = &func;
+        mWorkCount    = count;
         mNextIndex.store(0, std::memory_order_relaxed);
-        mActiveworkers = mNumWorkers;  // 所有工作线程都要参与
+        mActiveWorkers = mNumWorkers;
     }
-    mCvWork.notify_all(); // 唤醒所有工作线程
+    mCvWork.notify_all();
 
-    // 主线程也参与工作，减少空等
-    {
-        auto const& f = func;
-        while (true) {
-            size_t idx = mNextIndex.fetch_add(1, std::memory_order_acq_rel);
-            if (idx >= count) break;
-            f(idx);
-        }
+    // 主线程也参与执行
+    while (true) {
+        size_t idx = mNextIndex.fetch_add(1, std::memory_order_acq_rel);
+        if (idx >= count) break;
+        func(idx);
     }
 
     // 等待所有工作线程完成
     std::unique_lock lock(mMutex);
-    mCvDone.wait(lock, [this] { return mActiveworkers == 0; });
+    mCvDone.wait(lock, [this] { return mActiveWorkers == 0; });
     mWorkFunc = nullptr;
 }
 
 void TickWorkerPool::workerMain() {
     while (true) {
         std::unique_lock lock(mMutex);
-        // 等待有任务或关闭信号
         mCvWork.wait(lock, [this] {
             return mShutdown || mWorkFunc != nullptr;
         });
-
         if (mShutdown) return;
 
-        // 取得任务引用（mWorkFunc 此时有效）
         auto const& func  = *mWorkFunc;
         size_t      count = mWorkCount;
         lock.unlock();
 
-        // 执行任务
         while (true) {
             size_t idx = mNextIndex.fetch_add(1, std::memory_order_acq_rel);
             if (idx >= count) break;
             func(idx);
         }
 
-        // 报告完成
         {
             std::lock_guard lg(mMutex);
-            --mActiveworkers;
-            if (mActiveworkers == 0) {
+            if (--mActiveWorkers == 0) {
                 mCvDone.notify_one();
             }
         }
@@ -220,8 +213,8 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// Hook 2: Actor::tick — 跳过已并行处理的 ItemActor
-// 用 hasCategory 或直接用 getEntityTypeId 判断，避免 dynamic_cast 开销
+// Hook 2: Actor::tick
+// 绝对不用 dynamic_cast！用指针集合判断是否跳过
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorTickHook,
@@ -231,10 +224,10 @@ LL_TYPE_INSTANCE_HOOK(
     bool,
     ::BlockSource& region
 ) {
-    if (gSkipProcessedItems) {
-        // 用 mRemoved + isType 判断，ItemActor 的 ActorType 枚举值为 64（ItemEntity）
-        // 这里直接用 dynamic_cast 判断类型，只在串行阶段调用，不影响并行安全
-        if (dynamic_cast<ItemActor*>(this) != nullptr) {
+    // gProcessedActors 只在主线程的 phase3 期间被读取
+    // Actor::tick 也在主线程调用，所以无需加锁
+    if (!gProcessedActors.empty()) {
+        if (gProcessedActors.count(static_cast<void*>(this))) {
             return false;
         }
     }
@@ -242,7 +235,7 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// Hook 3: Level::$tick — 主逻辑
+// Hook 3: Level::$tick
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -265,25 +258,25 @@ LL_TYPE_INSTANCE_HOOK(
     std::vector<ItemEntry> items;
     items.reserve(256);
 
-    // 收集所有存活的 ItemActor
-    // getRuntimeActorList() 在主线程调用，安全
+    // 主线程收集 ItemActor，使用 hasCategory 或 getEntityTypeId
+    // 不用 dynamic_cast，直接用 ActorCategory 判断
     auto actorList = getRuntimeActorList();
     for (Actor* actor : actorList) {
-        if (!actor)            continue;
-        if (actor->mRemoved)   continue;
-        // static_cast 尝试：ItemActor 是 Actor 的子类
-        // 用 dynamic_cast 确保类型安全
-        auto* itemActor = dynamic_cast<ItemActor*>(actor);
-        if (!itemActor)        continue;
-        if (itemActor->isDead()) continue;
+        if (!actor)          continue;
+        if (actor->mRemoved) continue;
+        // ItemActor 的 ActorCategory 包含 Item
+        // 用 hasCategory 是纯虚函数调用，安全
+        if (!actor->hasCategory(::ActorCategory::Item)) continue;
+        if (actor->isDead()) continue;
+
         BlockSource& bs = actor->getDimensionBlockSource();
-        items.push_back({ itemActor, &bs });
+        // hasCategory 已确认是 ItemActor，static_cast 安全
+        items.push_back({ static_cast<ItemActor*>(actor), &bs });
     }
 
     size_t count = items.size();
 
     if (count < (size_t)gConfig.minParallelCnt) {
-        // 数量不足，走原版逻辑
         origin();
         if (gConfig.debug) {
             getLogger().info("Skipped parallel (count={} < min={})", count, gConfig.minParallelCnt);
@@ -291,42 +284,43 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // ── 阶段1: 并行 tick（抑制 merge 防止并发修改邻居）──
+    // ── 阶段1: 并行 tick（抑制 merge）──
     gWorkerPool->parallelFor(count, [&items](size_t i) {
-        gSuppressMerge = true;  // thread_local，每个线程独立
+        gSuppressMerge = true;
         items[i].actor->tick(*items[i].region);
         gSuppressMerge = false;
     });
 
-    // ── 阶段2: 串行 merge（主线程，安全）──
+    // ── 阶段2: 串行 merge + 建立跳过集合 ──
+    gProcessedActors.clear();
+    gProcessedActors.reserve(count);
     for (auto& e : items) {
         if (e.actor->mRemoved || e.actor->isDead()) continue;
         e.actor->_mergeWithNeighbours();
+        // 记录已处理的指针，让 ActorTickHook 跳过
+        gProcessedActors.insert(static_cast<void*>(e.actor));
     }
 
-    // ── 阶段3: 原版 tick，跳过已处理的 ItemActor ──
-    gSkipProcessedItems = true;
+    // ── 阶段3: 原版 tick（ActorTickHook 查集合跳过已处理的）──
     origin();
-    gSkipProcessedItems = false;
+
+    // 清理集合
+    gProcessedActors.clear();
 
     auto elapsedUs = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - tickStart
     ).count();
 
-    gTotalTicks.fetch_add(1,     std::memory_order_relaxed);
+    gTotalTicks.fetch_add(1,         std::memory_order_relaxed);
     gTotalProcessed.fetch_add(count, std::memory_order_relaxed);
     gTotalTimeUs.fetch_add(elapsedUs, std::memory_order_relaxed);
 
-    // 更新最大耗时
     uint64_t curMax = gMaxTimeUs.load(std::memory_order_relaxed);
     while (elapsedUs > curMax &&
            !gMaxTimeUs.compare_exchange_weak(curMax, elapsedUs, std::memory_order_relaxed));
 
     if (gConfig.debug) {
-        getLogger().info(
-            "Tick: {} items, {:.2f}ms",
-            count, elapsedUs / 1000.0
-        );
+        getLogger().info("Tick: {} items, {:.2f}ms", count, elapsedUs / 1000.0);
     }
 }
 
@@ -376,13 +370,13 @@ bool ParallelItemTickMod::enable() {
 bool ParallelItemTickMod::disable() {
     stopStatsTask();
 
+    // 先 unhook 再销毁线程池
     MergeWithNeighboursHook::unhook();
     ActorTickHook::unhook();
     LevelTickHook::unhook();
 
-    // 先 unhook 再销毁线程池，避免线程池销毁时仍有 hook 调用
     gWorkerPool.reset();
-    gSkipProcessedItems = false;
+    gProcessedActors.clear();
 
     getLogger().info("Disabled");
     return true;
@@ -390,4 +384,7 @@ bool ParallelItemTickMod::disable() {
 
 } // namespace parallel_item_tick
 
-LL_REGISTER_MOD(parallel_item_tick::ParallelItemTickMod, parallel_item_tick::ParallelItemTickMod::getInstance());
+LL_REGISTER_MOD(
+    parallel_item_tick::ParallelItemTickMod,
+    parallel_item_tick::ParallelItemTickMod::getInstance()
+);
