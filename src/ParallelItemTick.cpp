@@ -1,9 +1,11 @@
 // ParallelItemTick.cpp
 #include "ParallelItemTick.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include <ll/api/Config.h>
@@ -31,10 +33,7 @@ std::shared_ptr<ll::io::Logger> gLogger;
 bool                            gStatsRunning = false;
 std::unique_ptr<TickWorkerPool> gWorkerPool;
 
-// 已被并行处理的 ItemActor 指针集合（主线程独占）
-std::unordered_set<void*> gProcessedActors;
-
-thread_local bool gSuppressMerge = false;
+bool gSkipProcessedItems = false;
 
 std::atomic<uint64_t> gTotalTicks{0};
 std::atomic<uint64_t> gTotalProcessed{0};
@@ -43,7 +42,36 @@ std::atomic<uint64_t> gTotalTimeUs{0};
 std::atomic<uint64_t> gMaxTimeUs{0};
 
 // ============================================================
-// 日志
+// Per-dimension per-thread BlockSource 池
+// ============================================================
+struct DimBlockSources {
+    std::vector<std::unique_ptr<BlockSource>> sources;
+};
+static std::unordered_map<int, DimBlockSources> gBlockSourcePool;
+
+static void ensureBlockSources(BlockSource& originalBS, int dimId, int totalSlots) {
+    auto& entry = gBlockSourcePool[dimId];
+    if (entry.sources.size() >= static_cast<size_t>(totalSlots)) return;
+
+    entry.sources.reserve(totalSlots);
+    while (entry.sources.size() < static_cast<size_t>(totalSlots)) {
+        entry.sources.push_back(std::make_unique<BlockSource>(
+            originalBS.getLevel(),
+            originalBS.getDimension(),
+            originalBS.getChunkSource(),
+            true,
+            false,
+            false
+        ));
+    }
+}
+
+static void clearBlockSourcePool() {
+    gBlockSourcePool.clear();
+}
+
+// ============================================================
+// 工具函数
 // ============================================================
 ll::io::Logger& getLogger() {
     if (!gLogger) {
@@ -52,22 +80,19 @@ ll::io::Logger& getLogger() {
     return *gLogger;
 }
 
-// ============================================================
-// 配置
-// ============================================================
 bool loadConfig() {
     auto path = ParallelItemTickMod::getInstance().getSelf().getConfigDir() / "config.json";
     if (!std::filesystem::exists(path)) {
-        getLogger().info("Config not found, creating default");
+        getLogger().info("Config not found, creating default config.json");
         return saveConfig();
     }
     if (!ll::config::loadConfig(gConfig, path)) {
         getLogger().warn("Failed to load config, using defaults");
     }
     if (gConfig.minParallelCnt < 1) gConfig.minParallelCnt = 16;
-    if (gConfig.workerThreads  < 0) gConfig.workerThreads  = 0;
+    if (gConfig.workerThreads < 0)  gConfig.workerThreads  = 0;
     if (gConfig.workerThreads == 0) {
-        int cores             = (int)std::thread::hardware_concurrency();
+        int cores             = static_cast<int>(std::thread::hardware_concurrency());
         gConfig.workerThreads = std::max(1, std::min(cores - 1, 7));
     }
     return true;
@@ -78,9 +103,6 @@ bool saveConfig() {
     return ll::config::saveConfig(gConfig, path);
 }
 
-// ============================================================
-// 统计任务
-// ============================================================
 void startStatsTask() {
     if (gStatsRunning || !gConfig.stats) return;
     gStatsRunning = true;
@@ -91,27 +113,27 @@ void startStatsTask() {
             ll::thread::ServerThreadExecutor::getDefault().execute([] {
                 if (!gConfig.stats) return;
 
-                auto ticks   = gTotalTicks.load(std::memory_order_relaxed);
-                auto process = gTotalProcessed.load(std::memory_order_relaxed);
-                auto merged  = gTotalMerged.load(std::memory_order_relaxed);
-                auto time    = gTotalTimeUs.load(std::memory_order_relaxed);
-                auto maxT    = gMaxTimeUs.load(std::memory_order_relaxed);
+                auto totalTicks   = gTotalTicks.load(std::memory_order_relaxed);
+                auto totalProcess = gTotalProcessed.load(std::memory_order_relaxed);
+                auto totalMerged  = gTotalMerged.load(std::memory_order_relaxed);
+                auto totalTime    = gTotalTimeUs.load(std::memory_order_relaxed);
+                auto maxTime      = gMaxTimeUs.load(std::memory_order_relaxed);
 
                 getLogger().info(
-                    "Stats(5s): frames={}, items/f={:.1f}, merges/f={:.1f}, "
-                    "avg={:.2f}ms, max={:.2f}ms",
-                    ticks,
-                    ticks ? (double)process / ticks : 0.0,
-                    ticks ? (double)merged   / ticks : 0.0,
-                    ticks ? (double)time     / ticks / 1000.0 : 0.0,
-                    (double)maxT / 1000.0
+                    "Stats (5s): frames={}, items/frame={:.1f}, merges/frame={:.1f}, "
+                    "avgTime={:.2f}ms, maxTime={:.2f}ms",
+                    totalTicks,
+                    totalTicks ? static_cast<double>(totalProcess) / totalTicks : 0.0,
+                    totalTicks ? static_cast<double>(totalMerged) / totalTicks : 0.0,
+                    totalTicks ? static_cast<double>(totalTime) / totalTicks / 1000.0 : 0.0,
+                    static_cast<double>(maxTime) / 1000.0
                 );
 
-                gTotalTicks.store(0,     std::memory_order_relaxed);
+                gTotalTicks.store(0, std::memory_order_relaxed);
                 gTotalProcessed.store(0, std::memory_order_relaxed);
-                gTotalMerged.store(0,    std::memory_order_relaxed);
-                gTotalTimeUs.store(0,    std::memory_order_relaxed);
-                gMaxTimeUs.store(0,      std::memory_order_relaxed);
+                gTotalMerged.store(0, std::memory_order_relaxed);
+                gTotalTimeUs.store(0, std::memory_order_relaxed);
+                gMaxTimeUs.store(0, std::memory_order_relaxed);
             });
         }
         gStatsRunning = false;
@@ -134,7 +156,7 @@ TickWorkerPool::~TickWorkerPool() {
         std::lock_guard lock(mMutex);
         mShutdown = true;
     }
-    mCvWork.notify_all();
+    mWorkCv.notify_all();
     for (auto& w : mWorkers) {
         if (w.joinable()) w.join();
     }
@@ -143,78 +165,98 @@ TickWorkerPool::~TickWorkerPool() {
 void TickWorkerPool::parallelFor(size_t count, std::function<void(size_t)> const& func) {
     if (count == 0) return;
 
-    if (mNumWorkers == 0 || count < (size_t)gConfig.minParallelCnt) {
+    if (count < static_cast<size_t>(gConfig.minParallelCnt) || mNumWorkers == 0) {
         for (size_t i = 0; i < count; i++) func(i);
         return;
     }
 
     {
         std::lock_guard lock(mMutex);
-        mWorkFunc     = &func;
-        mWorkCount    = count;
+        mWorkFunc      = &func;
+        mWorkCount     = count;
         mNextIndex.store(0, std::memory_order_relaxed);
         mActiveWorkers = mNumWorkers;
+        mGeneration++;
     }
-    mCvWork.notify_all();
+    mWorkCv.notify_all();
 
-    // 主线程也参与执行
     while (true) {
         size_t idx = mNextIndex.fetch_add(1, std::memory_order_acq_rel);
         if (idx >= count) break;
         func(idx);
     }
 
-    // 等待所有工作线程完成
-    std::unique_lock lock(mMutex);
-    mCvDone.wait(lock, [this] { return mActiveWorkers == 0; });
+    {
+        std::unique_lock lock(mMutex);
+        mDoneCv.wait(lock, [this] { return mActiveWorkers == 0; });
+    }
+
     mWorkFunc = nullptr;
 }
 
 void TickWorkerPool::workerMain() {
+    uint64_t lastGen = 0;
     while (true) {
-        std::unique_lock lock(mMutex);
-        mCvWork.wait(lock, [this] {
-            return mShutdown || mWorkFunc != nullptr;
-        });
-        if (mShutdown) return;
-
-        auto const& func  = *mWorkFunc;
-        size_t      count = mWorkCount;
-        lock.unlock();
+        {
+            std::unique_lock lock(mMutex);
+            mWorkCv.wait(lock, [this, lastGen] {
+                return mShutdown || mGeneration > lastGen;
+            });
+            if (mShutdown) return;
+            lastGen = mGeneration;
+        }
 
         while (true) {
             size_t idx = mNextIndex.fetch_add(1, std::memory_order_acq_rel);
-            if (idx >= count) break;
-            func(idx);
+            if (idx >= mWorkCount) break;
+            try {
+                (*mWorkFunc)(idx);
+            } catch (...) {}
         }
 
         {
-            std::lock_guard lg(mMutex);
-            if (--mActiveWorkers == 0) {
-                mCvDone.notify_one();
-            }
+            std::lock_guard lock(mMutex);
+            mActiveWorkers--;
         }
+        mDoneCv.notify_one();
     }
 }
 
 // ============================================================
-// Hook 1: ItemActor::_mergeWithNeighbours
+// 线程槽位
 // ============================================================
-LL_TYPE_INSTANCE_HOOK(
-    MergeWithNeighboursHook,
-    ll::memory::HookPriority::Normal,
-    ItemActor,
-    &ItemActor::_mergeWithNeighbours,
-    void
-) {
-    if (gSuppressMerge) return;
-    origin();
-    gTotalMerged.fetch_add(1, std::memory_order_relaxed);
+static thread_local int tSlotId = -1;
+static std::atomic<int> gNextSlot{1};
+
+static int getSlotId() {
+    if (tSlotId < 0) {
+        tSlotId = gNextSlot.fetch_add(1, std::memory_order_relaxed);
+    }
+    return tSlotId;
 }
 
 // ============================================================
-// Hook 2: Actor::tick
-// 绝对不用 dynamic_cast！用指针集合判断是否跳过
+// Chunk 分组
+// ============================================================
+struct ChunkKey {
+    int dimId;
+    int x, z;
+    bool operator==(ChunkKey const& o) const {
+        return dimId == o.dimId && x == o.x && z == o.z;
+    }
+};
+
+struct ChunkKeyHash {
+    size_t operator()(ChunkKey const& k) const {
+        size_t h = std::hash<int>()(k.dimId);
+        h ^= std::hash<int>()(k.x) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>()(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+// ============================================================
+// Hook: Actor::tick
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorTickHook,
@@ -224,18 +266,14 @@ LL_TYPE_INSTANCE_HOOK(
     bool,
     ::BlockSource& region
 ) {
-    // gProcessedActors 只在主线程的 phase3 期间被读取
-    // Actor::tick 也在主线程调用，所以无需加锁
-    if (!gProcessedActors.empty()) {
-        if (gProcessedActors.count(static_cast<void*>(this))) {
-            return false;
-        }
+    if (gSkipProcessedItems && dynamic_cast<ItemActor*>(this) != nullptr) {
+        return false;
     }
     return origin(region);
 }
 
 // ============================================================
-// Hook 3: Level::$tick
+// Hook: Level::$tick
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -244,39 +282,44 @@ LL_TYPE_INSTANCE_HOOK(
     &Level::$tick,
     void
 ) {
-    if (!gConfig.enabled || !gWorkerPool) {
+    if (!gConfig.enabled) {
         origin();
         return;
     }
 
     auto tickStart = std::chrono::steady_clock::now();
 
+    // ── 收集所有存活的 ItemActor ──
     struct ItemEntry {
         ItemActor*   actor;
-        BlockSource* region;
+        BlockSource* originalBS;
+        int          dimId;
+        int          chunkX;
+        int          chunkZ;
     };
+
     std::vector<ItemEntry> items;
     items.reserve(256);
 
-    // 主线程收集 ItemActor，使用 hasCategory 或 getEntityTypeId
-    // 不用 dynamic_cast，直接用 ActorCategory 判断
     auto actorList = getRuntimeActorList();
     for (Actor* actor : actorList) {
-        if (!actor)          continue;
-        if (actor->mRemoved) continue;
-        // ItemActor 的 ActorCategory 包含 Item
-        // 用 hasCategory 是纯虚函数调用，安全
-        if (!actor->hasCategory(::ActorCategory::Item)) continue;
-        if (actor->isDead()) continue;
+        if (!actor || actor->mRemoved) continue;
+        auto* itemActor = dynamic_cast<ItemActor*>(actor);
+        if (!itemActor) continue;
 
         BlockSource& bs = actor->getDimensionBlockSource();
-        // hasCategory 已确认是 ItemActor，static_cast 安全
-        items.push_back({ static_cast<ItemActor*>(actor), &bs });
+        int dimId = static_cast<int>(bs.getDimensionId());
+
+        auto const& pos = actor->getPosition();
+        int cx = static_cast<int>(std::floor(pos.x)) >> 4;
+        int cz = static_cast<int>(std::floor(pos.z)) >> 4;
+
+        items.push_back({itemActor, &bs, dimId, cx, cz});
     }
 
     size_t count = items.size();
 
-    if (count < (size_t)gConfig.minParallelCnt) {
+    if (count < static_cast<size_t>(gConfig.minParallelCnt)) {
         origin();
         if (gConfig.debug) {
             getLogger().info("Skipped parallel (count={} < min={})", count, gConfig.minParallelCnt);
@@ -284,43 +327,100 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // ── 阶段1: 并行 tick（抑制 merge）──
-    gWorkerPool->parallelFor(count, [&items](size_t i) {
-        gSuppressMerge = true;
-        items[i].actor->tick(*items[i].region);
-        gSuppressMerge = false;
-    });
+    // ── 准备 per-thread BlockSource ──
+    int totalSlots = gWorkerPool->getNumWorkers() + 1;
 
-    // ── 阶段2: 串行 merge + 建立跳过集合 ──
-    gProcessedActors.clear();
-    gProcessedActors.reserve(count);
+    std::unordered_map<int, BlockSource*> involvedDims;
     for (auto& e : items) {
-        if (e.actor->mRemoved || e.actor->isDead()) continue;
-        e.actor->_mergeWithNeighbours();
-        // 记录已处理的指针，让 ActorTickHook 跳过
-        gProcessedActors.insert(static_cast<void*>(e.actor));
+        involvedDims.emplace(e.dimId, e.originalBS);
+    }
+    for (auto& [dimId, bs] : involvedDims) {
+        ensureBlockSources(*bs, dimId, totalSlots);
     }
 
-    // ── 阶段3: 原版 tick（ActorTickHook 查集合跳过已处理的）──
+    tSlotId = 0;
+    gNextSlot.store(1, std::memory_order_relaxed);
+
+    // ── 按 chunk 分组 ──
+    std::unordered_map<ChunkKey, std::vector<size_t>, ChunkKeyHash> chunkMap;
+    chunkMap.reserve(count / 4);
+    for (size_t i = 0; i < count; i++) {
+        ChunkKey key{items[i].dimId, items[i].chunkX, items[i].chunkZ};
+        chunkMap[key].push_back(i);
+    }
+
+    // ── 棋盘格 4 phase ──
+    std::vector<std::vector<size_t>> phases[4];
+
+    for (auto& [key, indices] : chunkMap) {
+        int px = key.x & 1;
+        int pz = key.z & 1;
+        int phase = (px << 1) | pz;
+        phases[phase].push_back(std::move(indices));
+    }
+
+    // ── 分 phase 执行 ──
+    for (int p = 0; p < 4; p++) {
+        auto& chunks = phases[p];
+        if (chunks.empty()) continue;
+
+        gWorkerPool->parallelFor(chunks.size(), [&](size_t chunkIdx) {
+            int slot = getSlotId();
+
+            for (size_t itemIdx : chunks[chunkIdx]) {
+                auto& e = items[itemIdx];
+
+                auto& pool = gBlockSourcePool[e.dimId];
+                int safeSlot = (slot < static_cast<int>(pool.sources.size())) ? slot : 0;
+                BlockSource& threadBS = *pool.sources[safeSlot];
+
+                try {
+                    e.actor->tick(threadBS);
+                } catch (...) {}
+            }
+        });
+
+        tSlotId = 0;
+        gNextSlot.store(1, std::memory_order_relaxed);
+    }
+
+    // ── 串行 merge ──
+    size_t mergeCount = 0;
+    for (auto& e : items) {
+        if (e.actor->mRemoved || e.actor->isDead()) continue;
+        try {
+            e.actor->_mergeWithNeighbours();
+            mergeCount++;
+        } catch (...) {}
+    }
+
+    // ── 原版 tick，跳过已处理的 ItemActor ──
+    gSkipProcessedItems = true;
     origin();
+    gSkipProcessedItems = false;
 
-    // 清理集合
-    gProcessedActors.clear();
+    // ── 统计 ──
+    auto elapsedUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - tickStart
+        ).count()
+    );
 
-    auto elapsedUs = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - tickStart
-    ).count();
-
-    gTotalTicks.fetch_add(1,         std::memory_order_relaxed);
+    gTotalTicks.fetch_add(1, std::memory_order_relaxed);
     gTotalProcessed.fetch_add(count, std::memory_order_relaxed);
+    gTotalMerged.fetch_add(mergeCount, std::memory_order_relaxed);
     gTotalTimeUs.fetch_add(elapsedUs, std::memory_order_relaxed);
 
     uint64_t curMax = gMaxTimeUs.load(std::memory_order_relaxed);
     while (elapsedUs > curMax &&
-           !gMaxTimeUs.compare_exchange_weak(curMax, elapsedUs, std::memory_order_relaxed));
+           !gMaxTimeUs.compare_exchange_weak(curMax, elapsedUs, std::memory_order_relaxed))
+        ;
 
     if (gConfig.debug) {
-        getLogger().info("Tick: {} items, {:.2f}ms", count, elapsedUs / 1000.0);
+        getLogger().info(
+            "Tick: {} items, {} chunks, {:.2f}ms",
+            count, chunkMap.size(), elapsedUs / 1000.0
+        );
     }
 }
 
@@ -354,15 +454,14 @@ bool ParallelItemTickMod::enable() {
 
     gWorkerPool = std::make_unique<TickWorkerPool>(gConfig.workerThreads);
 
-    MergeWithNeighboursHook::hook();
     ActorTickHook::hook();
     LevelTickHook::hook();
 
     if (gConfig.stats) startStatsTask();
 
     getLogger().info(
-        "Enabled. workers={}, minParallelCnt={}",
-        gConfig.workerThreads, gConfig.minParallelCnt
+        "Enabled with {} workers, per-thread BlockSource, checkerboard parallel",
+        gConfig.workerThreads
     );
     return true;
 }
@@ -370,13 +469,12 @@ bool ParallelItemTickMod::enable() {
 bool ParallelItemTickMod::disable() {
     stopStatsTask();
 
-    // 先 unhook 再销毁线程池
-    MergeWithNeighboursHook::unhook();
     ActorTickHook::unhook();
     LevelTickHook::unhook();
 
     gWorkerPool.reset();
-    gProcessedActors.clear();
+    clearBlockSourcePool();
+    gSkipProcessedItems = false;
 
     getLogger().info("Disabled");
     return true;
