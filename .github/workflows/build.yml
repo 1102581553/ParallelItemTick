@@ -14,7 +14,7 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Setup xmake
         uses: xmake-io/github-action-setup-xmake@v1
@@ -36,7 +36,6 @@ jobs:
         shell: pwsh
 
       # ── 缓存 xmake 包（最大瓶颈）──
-      # 只要 xmake.lua 不变，依赖包不会变
       - name: Cache xmake packages
         uses: actions/cache@v4
         id: cache-packages
@@ -51,7 +50,6 @@ jobs:
           save-always: true
 
       # ── 缓存构建中间产物（.obj）──
-      # 源码不变 = 编译结果不变
       - name: Cache build
         uses: actions/cache@v4
         id: cache-build
@@ -75,15 +73,14 @@ jobs:
       # ── 构建 ──
       - name: Build
         run: |
-          # 确保配置存在（缓存命中但配置丢失的情况）
           if (-not (Test-Path "build\.gens")) {
             xmake f -a x64 -m release -p windows -y
           }
           xmake -y -j $env:NUMBER_OF_PROCESSORS
         shell: pwsh
 
-      # ── 产物 ──
+      # ── 产物（用 run_number 区分，不影响缓存）──
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.repository.name }}-windows-x64
+          name: ${{ github.event.repository.name }}-windows-x64-${{ github.run_number }}
           path: bin/
