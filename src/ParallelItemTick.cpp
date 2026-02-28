@@ -10,7 +10,6 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include <ll/api/Config.h>
@@ -144,23 +143,37 @@ std::atomic<uint64_t> gTotalTimeUs{0};
 std::atomic<uint64_t> gMaxTimeUs{0};
 
 static std::atomic<bool> gInCustomPhase{false};
+static uint64_t          gFrameCounter = 0;
 
-static std::mutex                  gTickedMutex;
-static std::unordered_set<int64_t> gTickedIds;
+// 无锁已处理集合：用简单的 bool 数组 + 全局 generation 计数
+// 每帧递增 generation，normalTick hook 检查 actor 的 tickCount 是否匹配
+// 不需要任何锁
+static std::atomic<uint64_t> gTickGeneration{0};
+
+// 存储每个已处理 actor 的 UniqueID，用排序数组做二分查找（无锁，只在主线程写）
+static std::vector<int64_t> gTickedIdsSorted;
+static bool                 gTickedIdsDirty = false;
+
+static void clearTicked() {
+    gTickedIdsSorted.clear();
+    gTickedIdsDirty = false;
+}
 
 static void markTicked(int64_t id) {
-    std::lock_guard lock(gTickedMutex);
-    gTickedIds.insert(id);
+    gTickedIdsSorted.push_back(id);
+    gTickedIdsDirty = true;
+}
+
+static void finalizeTicked() {
+    if (gTickedIdsDirty) {
+        std::sort(gTickedIdsSorted.begin(), gTickedIdsSorted.end());
+        gTickedIdsDirty = false;
+    }
 }
 
 static bool wasTicked(int64_t id) {
-    std::lock_guard lock(gTickedMutex);
-    return gTickedIds.count(id) > 0;
-}
-
-static void clearTicked() {
-    std::lock_guard lock(gTickedMutex);
-    gTickedIds.clear();
+    // 二分查找，无锁
+    return std::binary_search(gTickedIdsSorted.begin(), gTickedIdsSorted.end(), id);
 }
 
 ll::io::Logger& getLogger() {
@@ -244,7 +257,8 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ============================================================
-// Hook: Actor::$normalTick — 用 UniqueID 跳过已处理的
+// Hook: Actor::$normalTick — 跳过已处理的 ItemActor
+// 只在主线程调用，无需锁
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     ActorNormalTickHook,
@@ -263,16 +277,19 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
+    // 自定义阶段放行
     if (gInCustomPhase.load(std::memory_order_acquire)) {
         origin();
         return;
     }
 
+    // 已移除的让原版处理
     if (this->mRemoved) {
         origin();
         return;
     }
 
+    // 检查是否已处理（无锁二分查找）
     auto uid = this->getOrCreateUniqueID();
     if (wasTicked(uid.rawID)) {
         return;
@@ -287,6 +304,7 @@ LL_TYPE_INSTANCE_HOOK(
 struct MergePair {
     size_t a;
     size_t b;
+    float  distSq;
 };
 
 struct ItemInfo {
@@ -301,16 +319,16 @@ struct ItemMergeInfo {
     short auxValue;
     uchar count;
     uchar maxStack;
+    bool  hasUserData;
 };
 
-// 并行查找合并候选对（纯只读，不调用任何 BDS API）
+// 并行查找合并候选对（纯只读）
 static std::vector<MergePair> findMergeCandidatesParallel(
     std::vector<ItemInfo>&      items,
     std::vector<ItemMergeInfo>& mergeInfo
 ) {
     if (items.empty()) return {};
 
-    // 构建空间哈希
     std::unordered_map<CellKey, std::vector<size_t>, CellKeyHash> grid;
     grid.reserve(items.size());
 
@@ -320,7 +338,6 @@ static std::vector<MergePair> findMergeCandidatesParallel(
         grid[key].push_back(i);
     }
 
-    // 收集所有 cell key
     std::vector<CellKey> allCells;
     allCells.reserve(grid.size());
     for (auto& [key, _] : grid) {
@@ -329,7 +346,6 @@ static std::vector<MergePair> findMergeCandidatesParallel(
 
     if (allCells.empty()) return {};
 
-    // 并行查找候选对
     std::mutex             pairsMutex;
     std::vector<MergePair> allPairs;
 
@@ -365,13 +381,15 @@ static std::vector<MergePair> findMergeCandidatesParallel(
 
                                     if (infoA.itemId != infoB.itemId) continue;
                                     if (infoA.auxValue != infoB.auxValue) continue;
+                                    if (infoA.hasUserData != infoB.hasUserData) continue;
 
                                     float ddx = items[idx].x - items[j].x;
                                     float ddy = items[idx].y - items[j].y;
                                     float ddz = items[idx].z - items[j].z;
-                                    if (ddx * ddx + ddy * ddy + ddz * ddz > 1.0f) continue;
+                                    float dSq = ddx * ddx + ddy * ddy + ddz * ddz;
+                                    if (dSq > 1.0f) continue;
 
-                                    localPairs.push_back({idx, j});
+                                    localPairs.push_back({idx, j, dSq});
                                 }
                             }
                         }
@@ -392,11 +410,15 @@ static std::vector<MergePair> findMergeCandidatesParallel(
         tasks[0]();
     }
 
+    std::sort(allPairs.begin(), allPairs.end(), [](const MergePair& a, const MergePair& b) {
+        return a.distSq < b.distSq;
+    });
+
     return allPairs;
 }
 
 // ============================================================
-// Hook: Level::$tick — 主逻辑
+// Hook: Level::$tick
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -413,6 +435,7 @@ LL_TYPE_INSTANCE_HOOK(
     auto tickStart = std::chrono::steady_clock::now();
 
     clearTicked();
+    gFrameCounter++;
 
     std::vector<ItemInfo> items;
     items.reserve(512);
@@ -435,7 +458,7 @@ LL_TYPE_INSTANCE_HOOK(
     if (count > 0) {
         gInCustomPhase.store(true, std::memory_order_release);
 
-        // 阶段1：主线程串行 tick（_mergeWithNeighbours 被跳过）
+        // 阶段1：主线程串行 tick
         for (auto& e : items) {
             if (e.actor->mRemoved || e.actor->isDead()) continue;
             BlockSource& bs = e.actor->getDimensionBlockSource();
@@ -443,51 +466,71 @@ LL_TYPE_INSTANCE_HOOK(
             markTicked(e.uid);
         }
 
-        // 更新位置 + 预计算合并信息（主线程读取 BDS 数据）
-        std::vector<ItemMergeInfo> mergeInfo(count);
-        for (size_t i = 0; i < count; ++i) {
-            auto* a = items[i].actor;
-            if (a->mRemoved || a->isDead()) {
-                mergeInfo[i].valid = false;
-                continue;
+        // 排序已处理 ID 列表（为 origin() 阶段的二分查找准备）
+        finalizeTicked();
+
+        // 阶段2：每 mergeInterval 帧做一次合并
+        bool doMerge = (gFrameCounter % static_cast<uint64_t>(gConfig.mergeInterval)) == 0;
+
+        if (doMerge && count > 1) {
+            std::vector<ItemMergeInfo> mergeInfo(count);
+            for (size_t i = 0; i < count; ++i) {
+                auto* a = items[i].actor;
+                if (a->mRemoved || a->isDead()) {
+                    mergeInfo[i].valid = false;
+                    continue;
+                }
+                auto& pos  = a->getPosition();
+                items[i].x = pos.x;
+                items[i].y = pos.y;
+                items[i].z = pos.z;
+
+                auto& stack = a->item();
+                if (stack.isNull()) {
+                    mergeInfo[i].valid = false;
+                    continue;
+                }
+
+                uchar maxStack = stack.getMaxStackSize();
+                if (stack.mCount >= maxStack) {
+                    mergeInfo[i].valid = false;
+                    continue;
+                }
+
+                if (a->pickupDelay() > 0 && a->age() < 20) {
+                    mergeInfo[i].valid = false;
+                    continue;
+                }
+
+                mergeInfo[i].valid       = true;
+                mergeInfo[i].itemId      = stack.getId();
+                mergeInfo[i].auxValue    = stack.getAuxValue();
+                mergeInfo[i].count       = stack.mCount;
+                mergeInfo[i].maxStack    = maxStack;
+                mergeInfo[i].hasUserData = (stack.mUserData != nullptr);
             }
-            auto& pos = a->getPosition();
-            items[i].x = pos.x;
-            items[i].y = pos.y;
-            items[i].z = pos.z;
 
-            auto& stack = a->item();
-            if (stack.isNull()) {
-                mergeInfo[i].valid = false;
-                continue;
-            }
-            mergeInfo[i].valid    = true;
-            mergeInfo[i].itemId   = stack.getId();
-            mergeInfo[i].auxValue = stack.getAuxValue();
-            mergeInfo[i].count    = stack.mCount;
-            mergeInfo[i].maxStack = stack.getMaxStackSize();
-        }
+            auto pairs = findMergeCandidatesParallel(items, mergeInfo);
+            candidates = pairs.size();
 
-        // 阶段2：并行查找合并候选对（纯只读计算）
-        auto pairs = findMergeCandidatesParallel(items, mergeInfo);
-        candidates = pairs.size();
+            int maxMerges = gConfig.maxMergesPerFrame;
+            for (auto& p : pairs) {
+                if (static_cast<int>(mergeCount) >= maxMerges) break;
 
-        // 阶段3：主线程串行执行合并
-        for (auto& p : pairs) {
-            auto* a = items[p.a].actor;
-            auto* b = items[p.b].actor;
-            if (a->mRemoved || a->isDead()) continue;
-            if (b->mRemoved || b->isDead()) continue;
+                auto* a = items[p.a].actor;
+                auto* b = items[p.b].actor;
+                if (a->mRemoved || a->isDead()) continue;
+                if (b->mRemoved || b->isDead()) continue;
 
-            if (a->_merge(b)) {
-                mergeCount++;
+                if (a->_merge(b)) {
+                    mergeCount++;
+                }
             }
         }
 
         gInCustomPhase.store(false, std::memory_order_release);
     }
 
-    // 原版 tick，已处理的 ItemActor 通过 UniqueID 跳过
     origin();
 
     auto elapsedUs = static_cast<uint64_t>(
@@ -529,9 +572,9 @@ bool ParallelItemTickMod::load() {
         saveConfig();
     }
     getLogger().info(
-        "Loaded. enabled={}, debug={}, stats={}, threads={}, batchSize={}",
+        "Loaded. enabled={}, debug={}, stats={}, threads={}, mergeInterval={}, maxMerges={}",
         gConfig.enabled, gConfig.debug, gConfig.stats,
-        gConfig.numThreads, gConfig.batchSize
+        gConfig.numThreads, gConfig.mergeInterval, gConfig.maxMergesPerFrame
     );
     return true;
 }
@@ -556,8 +599,8 @@ bool ParallelItemTickMod::enable() {
     if (gConfig.stats) startStatsTask();
 
     getLogger().info(
-        "Enabled — {} threads, parallel candidate search + O(n) spatial hash",
-        threads
+        "Enabled — {} threads, merge every {} ticks, max {}/frame",
+        threads, gConfig.mergeInterval, gConfig.maxMergesPerFrame
     );
     return true;
 }
@@ -569,6 +612,7 @@ bool ParallelItemTickMod::disable() {
     LevelTickHook::unhook();
     gThreadPool.reset();
     clearTicked();
+    gFrameCounter = 0;
     getLogger().info("Disabled");
     return true;
 }
