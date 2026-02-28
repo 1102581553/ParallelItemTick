@@ -144,30 +144,31 @@ std::atomic<uint64_t> gMaxTimeUs{0};
 
 static uint64_t gFrameCounter = 0;
 
-// 已处理集合：排序指针数组，只在主线程读写
-static std::vector<const Actor*> gTickedActors;
-static bool                      gTickedSorted = false;
+// 每帧合并结果缓存，供 _mergeWithNeighbours hook 使用
+struct MergePair {
+    size_t a;
+    size_t b;
+    float  distSq;
+};
 
-static void clearTicked() {
-    gTickedActors.clear();
-    gTickedSorted = false;
-}
+struct ItemInfo {
+    ItemActor* actor;
+    float      x, y, z;
+};
 
-static void markTicked(const Actor* actor) {
-    gTickedActors.push_back(actor);
-    gTickedSorted = false;
-}
+struct ItemMergeInfo {
+    bool  valid;
+    short itemId;
+    short auxValue;
+    uchar count;
+    uchar maxStack;
+    bool  hasUserData;
+};
 
-static void finalizeTicked() {
-    if (!gTickedSorted && !gTickedActors.empty()) {
-        std::sort(gTickedActors.begin(), gTickedActors.end());
-        gTickedSorted = true;
-    }
-}
-
-static bool wasTicked(const Actor* actor) {
-    return std::binary_search(gTickedActors.begin(), gTickedActors.end(), actor);
-}
+// 当前帧的合并任务
+static std::vector<std::pair<ItemActor*, ItemActor*>> gPendingMerges;
+static size_t                                         gPendingMergeIdx = 0;
+static bool                                           gMergeReady      = false;
 
 ll::io::Logger& getLogger() {
     if (!gLogger) {
@@ -234,80 +235,8 @@ void startStatsTask() {
 void stopStatsTask() { gStatsRunning = false; }
 
 // ============================================================
-// Hook: ItemActor::_mergeWithNeighbours — 跳过原版 O(n²) 合并
+// 并行查找合并候选对（纯只读计算）
 // ============================================================
-LL_TYPE_INSTANCE_HOOK(
-    MergeWithNeighboursHook,
-    ll::memory::HookPriority::Normal,
-    ItemActor,
-    &ItemActor::_mergeWithNeighbours,
-    void
-) {
-    if (gConfig.enabled) {
-        return;
-    }
-    origin();
-}
-
-// ============================================================
-// Hook: Actor::tick — 跳过已处理的 ItemActor
-// 用非虚函数 Actor::tick(BlockSource&) 而不是虚函数 normalTick
-// 这样不会和 normalTick 内部产生重入问题
-// ============================================================
-LL_TYPE_INSTANCE_HOOK(
-    ActorTickHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::tick,
-    bool,
-    BlockSource& region
-) {
-    if (!gConfig.enabled) {
-        return origin(region);
-    }
-
-    // 只拦截 ItemActor
-    if (this->getEntityTypeId() != ActorType::ItemEntity) {
-        return origin(region);
-    }
-
-    // 已移除的让原版处理
-    if (this->mRemoved) {
-        return origin(region);
-    }
-
-    // 检查是否已处理
-    if (wasTicked(this)) {
-        return true; // 跳过，返回 true 表示 tick 成功
-    }
-
-    return origin(region);
-}
-
-// ============================================================
-// 合并候选对
-// ============================================================
-struct MergePair {
-    size_t a;
-    size_t b;
-    float  distSq;
-};
-
-struct ItemInfo {
-    ItemActor* actor;
-    float      x, y, z;
-};
-
-struct ItemMergeInfo {
-    bool  valid;
-    short itemId;
-    short auxValue;
-    uchar count;
-    uchar maxStack;
-    bool  hasUserData;
-};
-
-// 并行查找合并候选对（纯只读）
 static std::vector<MergePair> findMergeCandidatesParallel(
     std::vector<ItemInfo>&      items,
     std::vector<ItemMergeInfo>& mergeInfo
@@ -403,7 +332,29 @@ static std::vector<MergePair> findMergeCandidatesParallel(
 }
 
 // ============================================================
+// Hook: ItemActor::_mergeWithNeighbours
+// 替换原版 O(n²) 合并：从预计算的合并列表中消费
+// ============================================================
+LL_TYPE_INSTANCE_HOOK(
+    MergeWithNeighboursHook,
+    ll::memory::HookPriority::Normal,
+    ItemActor,
+    &ItemActor::_mergeWithNeighbours,
+    void
+) {
+    if (!gConfig.enabled) {
+        origin();
+        return;
+    }
+
+    // 不调用原版 O(n²)，合并由 LevelTickHook 后处理
+    return;
+}
+
+// ============================================================
 // Hook: Level::$tick
+// 策略：让原版正常 tick 所有实体（包括 ItemActor），
+// 我们只在 tick 之后做并行合并查找 + 主线程合并执行
 // ============================================================
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
@@ -418,54 +369,42 @@ LL_TYPE_INSTANCE_HOOK(
     }
 
     auto tickStart = std::chrono::steady_clock::now();
-
-    clearTicked();
     gFrameCounter++;
 
-    std::vector<ItemInfo> items;
-    items.reserve(512);
+    // 让原版正常 tick 所有实体（_mergeWithNeighbours 被跳过）
+    origin();
 
-    auto actorList = getRuntimeActorList();
-    for (Actor* actor : actorList) {
-        if (!actor || actor->mRemoved) continue;
-        if (actor->getEntityTypeId() != ActorType::ItemEntity) continue;
-
-        auto* itemActor = static_cast<ItemActor*>(actor);
-        auto& pos       = actor->getPosition();
-        items.push_back({itemActor, pos.x, pos.y, pos.z});
-    }
-
-    size_t count      = items.size();
+    size_t count      = 0;
     size_t mergeCount = 0;
     size_t candidates = 0;
 
-    if (count > 0) {
-        // 阶段1：主线程串行 tick（_mergeWithNeighbours 被跳过）
-        for (auto& e : items) {
-            if (e.actor->mRemoved || e.actor->isDead()) continue;
-            BlockSource& bs = e.actor->getDimensionBlockSource();
-            e.actor->tick(bs);
-            markTicked(e.actor);
+    // 每 mergeInterval 帧做一次合并
+    bool doMerge = (gFrameCounter % static_cast<uint64_t>(gConfig.mergeInterval)) == 0;
+
+    if (doMerge) {
+        // 收集所有 ItemActor
+        std::vector<ItemInfo> items;
+        items.reserve(512);
+
+        auto actorList = getRuntimeActorList();
+        for (Actor* actor : actorList) {
+            if (!actor || actor->mRemoved) continue;
+            if (actor->getEntityTypeId() != ActorType::ItemEntity) continue;
+
+            auto* itemActor = static_cast<ItemActor*>(actor);
+            if (itemActor->isDead()) continue;
+
+            auto& pos = actor->getPosition();
+            items.push_back({itemActor, pos.x, pos.y, pos.z});
         }
 
-        // 排序已处理指针列表（为 origin() 阶段的 ActorTickHook 准备）
-        finalizeTicked();
+        count = items.size();
 
-        // 阶段2：每 mergeInterval 帧做一次合并
-        bool doMerge = (gFrameCounter % static_cast<uint64_t>(gConfig.mergeInterval)) == 0;
-
-        if (doMerge && count > 1) {
+        if (count > 1) {
+            // 主线程预计算合并信息
             std::vector<ItemMergeInfo> mergeInfo(count);
             for (size_t i = 0; i < count; ++i) {
                 auto* a = items[i].actor;
-                if (a->mRemoved || a->isDead()) {
-                    mergeInfo[i].valid = false;
-                    continue;
-                }
-                auto& pos  = a->getPosition();
-                items[i].x = pos.x;
-                items[i].y = pos.y;
-                items[i].z = pos.z;
 
                 auto& stack = a->item();
                 if (stack.isNull()) {
@@ -492,9 +431,11 @@ LL_TYPE_INSTANCE_HOOK(
                 mergeInfo[i].hasUserData = (stack.mUserData != nullptr);
             }
 
+            // 并行查找候选对
             auto pairs = findMergeCandidatesParallel(items, mergeInfo);
             candidates = pairs.size();
 
+            // 主线程串行合并
             int maxMerges = gConfig.maxMergesPerFrame;
             for (auto& p : pairs) {
                 if (static_cast<int>(mergeCount) >= maxMerges) break;
@@ -510,12 +451,6 @@ LL_TYPE_INSTANCE_HOOK(
             }
         }
     }
-
-    // 原版 tick，已处理的 ItemActor 通过 ActorTickHook 跳过
-    origin();
-
-    // 清除（下一帧重新收集）
-    clearTicked();
 
     auto elapsedUs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -576,7 +511,6 @@ bool ParallelItemTickMod::enable() {
     gThreadPool = std::make_unique<ThreadPool>(static_cast<size_t>(threads));
 
     LevelTickHook::hook();
-    ActorTickHook::hook();
     MergeWithNeighboursHook::hook();
 
     if (gConfig.stats) startStatsTask();
@@ -591,10 +525,8 @@ bool ParallelItemTickMod::enable() {
 bool ParallelItemTickMod::disable() {
     stopStatsTask();
     MergeWithNeighboursHook::unhook();
-    ActorTickHook::unhook();
     LevelTickHook::unhook();
     gThreadPool.reset();
-    clearTicked();
     gFrameCounter = 0;
     getLogger().info("Disabled");
     return true;
